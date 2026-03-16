@@ -1,5 +1,6 @@
 'use strict';
 
+const crypto = require('crypto');
 const https = require('https');
 const http = require('http');
 const cheerio = require('cheerio');
@@ -199,6 +200,52 @@ function httpDelete(url, cookie, csrfToken) {
   });
 }
 
+function httpPostMultipart(url, cookie, csrfToken, fileName, fileBuffer) {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const httpModule = parsed.protocol === 'http:' ? http : https;
+    const boundary = '----overleap' + crypto.randomBytes(16).toString('hex');
+
+    const header = Buffer.from(
+      `--${boundary}\r\n` +
+      `Content-Disposition: form-data; name="qqfile"; filename="${fileName}"\r\n` +
+      `Content-Type: application/octet-stream\r\n\r\n`
+    );
+    const footer = Buffer.from(`\r\n--${boundary}--\r\n`);
+    const body = Buffer.concat([header, fileBuffer, footer]);
+
+    const options = {
+      hostname: parsed.hostname,
+      port: parsed.port || (parsed.protocol === 'http:' ? 80 : 443),
+      path: parsed.pathname + parsed.search,
+      method: 'POST',
+      headers: {
+        'Cookie': cookie,
+        'X-Csrf-Token': csrfToken,
+        'Content-Type': `multipart/form-data; boundary=${boundary}`,
+        'Content-Length': body.length,
+        'User-Agent': 'overleap/0.1',
+        'Accept': 'application/json',
+      },
+    };
+
+    const req = httpModule.request(options, (res) => {
+      let responseBody = '';
+      res.on('data', (chunk) => { responseBody += chunk; });
+      res.on('end', () => {
+        resolve({ status: res.statusCode, headers: res.headers, body: responseBody });
+      });
+    });
+
+    req.on('error', reject);
+    req.setTimeout(120000, () => {
+      req.destroy(new Error('Upload timeout'));
+    });
+    req.write(body);
+    req.end();
+  });
+}
+
 function httpGetBinary(url, cookie) {
   return new Promise((resolve, reject) => {
     const parsed = new URL(url);
@@ -230,4 +277,4 @@ function httpGetBinary(url, cookie) {
   });
 }
 
-module.exports = { fetchProjectPage, updateCookies, httpGet, httpPost, httpGetBinary };
+module.exports = { fetchProjectPage, updateCookies, httpGet, httpPost, httpDelete, httpPostMultipart, httpGetBinary };

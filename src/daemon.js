@@ -159,7 +159,7 @@ class Daemon {
     });
 
     // 4. Start sync engine
-    this.syncEngine = new SyncEngine(this.socketManager, this.watcher, dir, url, updatedCookie);
+    this.syncEngine = new SyncEngine(this.socketManager, this.watcher, dir, url, updatedCookie, projectId, csrfToken);
 
     // 5. Initial sync
     await this.syncEngine.initialSync(joinResult.project);
@@ -214,12 +214,13 @@ class Daemon {
           this.syncEngine.detach(); // remove watcher listener
         }
 
+        const { csrfToken } = await fetchProjectPage(cookie, url);
         this.socketManager = new SocketManager(updatedCookie, this._projectId, url);
         const joinResult = await this.socketManager.connect();
         console.log('[daemon] Reconnected successfully');
 
         // Re-initialize sync
-        this.syncEngine = new SyncEngine(this.socketManager, this.watcher, dir, url, updatedCookie);
+        this.syncEngine = new SyncEngine(this.socketManager, this.watcher, dir, url, updatedCookie, this._projectId, csrfToken);
         await this.syncEngine.initialSync(joinResult.project);
 
         // H3: single disconnect handler via once

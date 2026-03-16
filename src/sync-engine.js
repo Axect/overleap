@@ -4,14 +4,38 @@ const fs = require('fs');
 const path = require('path');
 const { computeOps } = require('./diff');
 const { flattenTree } = require('./tree');
+const { httpPost, httpDelete, httpPostMultipart, httpGetBinary } = require('./auth');
+
+const TEXT_EXTENSIONS = new Set([
+  '.tex', '.bib', '.cls', '.sty', '.bst', '.def', '.cfg', '.dtx', '.ins',
+  '.fd', '.clo', '.ldf', '.bbx', '.cbx', '.dbx', '.lbx',
+  '.txt', '.md', '.csv', '.tsv', '.log', '.bbl', '.aux', '.toc',
+  '.lof', '.lot', '.out', '.nav', '.snm', '.vrb', '.listing',
+  '.tikz', '.pgf', '.eps_tex', '.pdf_tex',
+  '.spl', '.glsdefs', '.ist', '.gls', '.glo', '.acn', '.acr', '.alg',
+  '.idx', '.ind', '.ilg', '.nlo', '.nls', '.nomencl',
+  '.pytxcode', '.rnw', '.rtex',
+  '.latexmkrc', '.gitignore', '.yml', '.yaml', '.json', '.xml', '.html',
+  '.css', '.js', '.r', '.py', '.lua', '.sh', '.bat', '.makefile',
+]);
+
+function isTextFile(relativePath) {
+  const basename = path.basename(relativePath).toLowerCase();
+  // Files without extension but known names
+  if (basename === 'makefile' || basename === 'latexmkrc' || basename === '.gitignore') return true;
+  const ext = path.extname(relativePath).toLowerCase();
+  return ext !== '' && TEXT_EXTENSIONS.has(ext);
+}
 
 class SyncEngine {
-  constructor(socketManager, watcher, dir, baseUrl, cookie) {
+  constructor(socketManager, watcher, dir, baseUrl, cookie, projectId, csrfToken) {
     this.socket = socketManager;
     this.watcher = watcher;
     this.dir = path.resolve(dir);
     this.baseUrl = baseUrl;
     this.cookie = cookie;
+    this.projectId = projectId;
+    this.csrfToken = csrfToken;
 
     // State per document: docId → { path, version, content, sending, dirty, pendingContent, needsResync }
     // content: last server-confirmed content
@@ -21,6 +45,15 @@ class SyncEngine {
     this.pathToDocId = new Map();
     // Binary files: fileRefId → relativePath
     this.filePaths = new Map();
+    // Reverse map: relativePath → fileRefId
+    this.pathToFileId = new Map();
+    // Folder tracking: relativePath → folderId
+    this.pathToFolderId = new Map();
+    this.rootFolderId = null;
+    // Prevent duplicate creation/upload attempts
+    this._creatingFiles = new Set();
+    // Per-doc flush debounce timers (rapid edit protection)
+    this._flushTimers = new Map();
 
     // H2: store bound handler reference for cleanup
     this._onFileChange = (event) => this._onLocalChange(event);
@@ -44,7 +77,15 @@ class SyncEngine {
     });
 
     this.socket.on('reciveNewDoc', ({ parentFolderId, doc }) => {
-      console.log(`[sync] New doc on server: ${doc.name}`);
+      this._handleRemoteDocCreate(parentFolderId, doc).catch((e) =>
+        console.error('[sync] Remote doc create error:', e.message)
+      );
+    });
+
+    this.socket.on('reciveNewFile', ({ parentFolderId, file }) => {
+      this._handleRemoteFileCreate(parentFolderId, file).catch((e) =>
+        console.error('[sync] Remote file create error:', e.message)
+      );
     });
 
     // M3: use async fs.promises.unlink instead of blocking unlinkSync
@@ -57,6 +98,17 @@ class SyncEngine {
         fs.promises.unlink(absPath).catch(() => {}).finally(release);
         this.docs.delete(entityId);
         this.pathToDocId.delete(docState.path);
+        return;
+      }
+
+      const filePath = this.filePaths.get(entityId);
+      if (filePath) {
+        console.log(`[sync] Binary file removed on server: ${filePath}`);
+        const absPath = path.join(this.dir, filePath);
+        const release = this.watcher.suppress(absPath);
+        fs.promises.unlink(absPath).catch(() => {}).finally(release);
+        this.filePaths.delete(entityId);
+        this.pathToFileId.delete(filePath);
       }
     });
 
@@ -75,9 +127,12 @@ class SyncEngine {
    * Initial sync: join all docs, write to local filesystem.
    */
   async initialSync(project) {
-    const { docPaths, pathDocs, filePaths, pathFiles } = flattenTree(project.rootFolder);
+    const { docPaths, pathDocs, filePaths, pathFiles, pathFolders, rootFolderId } = flattenTree(project.rootFolder);
 
     this.filePaths = filePaths;
+    this.pathToFileId = pathFiles;
+    this.pathToFolderId = pathFolders;
+    this.rootFolderId = rootFolderId;
 
     fs.mkdirSync(this.dir, { recursive: true });
 
@@ -117,7 +172,6 @@ class SyncEngine {
     // Download binary files — skip if already exists locally
     const fileEntries = Array.from(filePaths.entries());
     if (fileEntries.length > 0) {
-      const { httpGetBinary } = require('./auth');
       let downloaded = 0, skipped = 0;
 
       for (const [fileId, relPath] of fileEntries) {
@@ -129,7 +183,7 @@ class SyncEngine {
         }
 
         try {
-          const url = `${this.baseUrl}/project/${this.socket.projectId}/file/${fileId}`;
+          const url = `${this.baseUrl}/project/${this.projectId}/file/${fileId}`;
           const res = await httpGetBinary(url, this.cookie);
           if (res.status === 200) {
             fs.mkdirSync(path.dirname(absPath), { recursive: true });
@@ -151,7 +205,68 @@ class SyncEngine {
       }
     }
 
+    // Upload local-only files that don't exist on the server
+    await this._uploadLocalOnly();
+
     console.log(`[sync] Initial sync complete. Watching for changes...`);
+  }
+
+  /**
+   * Scan local directory for files not tracked by the server and upload them.
+   */
+  async _uploadLocalOnly() {
+    const localFiles = this._scanDir(this.dir, '');
+    const serverPaths = new Set([...this.pathToDocId.keys(), ...this.pathToFileId.keys()]);
+
+    const untracked = localFiles.filter((rel) => !serverPaths.has(rel));
+    if (untracked.length === 0) return;
+
+    console.log(`[sync] Found ${untracked.length} local-only file(s), uploading...`);
+
+    for (const relativePath of untracked) {
+      try {
+        await this._handleLocalCreate(relativePath);
+      } catch (err) {
+        console.error(`  ✗ ${relativePath}: ${err.message}`);
+      }
+    }
+  }
+
+  /**
+   * Recursively scan a directory, returning relative paths (respecting watcher ignore patterns).
+   */
+  _scanDir(base, prefix) {
+    const results = [];
+    const ignorePatterns = [
+      /(^|[/\\])\../,
+      /node_modules/,
+      /\.git/,
+      /\.env(\.|$)/,
+      /~$/,
+      /\.swp$/,
+      /\.swo$/,
+      /\.tmp\.\d+$/,
+    ];
+
+    let entries;
+    try {
+      entries = fs.readdirSync(path.join(base, prefix), { withFileTypes: true });
+    } catch (e) {
+      return results;
+    }
+
+    for (const entry of entries) {
+      const rel = prefix ? prefix + '/' + entry.name : entry.name;
+      if (ignorePatterns.some((p) => p.test(rel))) continue;
+
+      if (entry.isDirectory()) {
+        results.push(...this._scanDir(base, rel));
+      } else if (entry.isFile()) {
+        results.push(rel);
+      }
+    }
+
+    return results;
   }
 
   /**
@@ -184,7 +299,7 @@ class SyncEngine {
 
       if (docState.dirty) {
         docState.dirty = false;
-        this._flushDoc(update.doc).catch((e) => console.error('[sync] Flush error:', e.message));
+        this._scheduleFlush(update.doc);
       }
       return;
     }
@@ -229,35 +344,368 @@ class SyncEngine {
   }
 
   /**
-   * Handle local file change → queue OT update.
+   * Handle local file change → queue OT update, create, or delete on server.
    */
   _onLocalChange(event) {
     const { type, relativePath } = event;
 
     if (type === 'unlink') {
-      console.log(`[local] File deleted: ${relativePath} (not synced to server)`);
+      this._handleLocalDelete(relativePath).catch((e) =>
+        console.error('[sync] Delete error:', e.message)
+      );
       return;
     }
 
+    // Existing text doc — OT sync
     const docId = this.pathToDocId.get(relativePath);
-    if (!docId) {
-      return; // binary or untracked file — ignore silently
-    }
+    if (docId) {
+      const docState = this.docs.get(docId);
+      if (!docState) return;
 
-    const docState = this.docs.get(docId);
-    if (!docState) return;
+      if (docState.sending) {
+        docState.dirty = true;
+        return;
+      }
 
-    if (docState.sending) {
-      docState.dirty = true;
+      this._scheduleFlush(docId);
       return;
     }
 
-    this._flushDoc(docId).catch((e) => console.error('[sync] Flush error:', e.message));
+    // Existing binary file — re-upload
+    const fileId = this.pathToFileId.get(relativePath);
+    if (fileId && type === 'change') {
+      this._handleBinaryUpdate(relativePath, fileId).catch((e) =>
+        console.error('[sync] Binary update error:', e.message)
+      );
+      return;
+    }
+
+    // Untracked file — create on server
+    // Handles both 'add' (new file) and 'change' (file existed locally before sync started)
+    this._handleLocalCreate(relativePath).catch((e) =>
+      console.error('[sync] Create error:', e.message)
+    );
+  }
+
+  /**
+   * Schedule a debounced flush for a document.
+   * Coalesces rapid edits (e.g. from AI agents) into a single OT update.
+   */
+  _scheduleFlush(docId, delay = 150) {
+    if (this._flushTimers.has(docId)) {
+      clearTimeout(this._flushTimers.get(docId));
+    }
+    this._flushTimers.set(docId, setTimeout(() => {
+      this._flushTimers.delete(docId);
+      this._flushDoc(docId).catch((e) => console.error('[sync] Flush error:', e.message));
+    }, delay));
+  }
+
+  /**
+   * Create a new file (text doc or binary) on Overleaf when a local file is added.
+   */
+  async _handleLocalCreate(relativePath) {
+    if (this._creatingFiles.has(relativePath)) return;
+    this._creatingFiles.add(relativePath);
+
+    try {
+      const absPath = path.join(this.dir, relativePath);
+      const fileName = path.basename(relativePath);
+      const dirName = path.dirname(relativePath);
+
+      // Determine parent folder ID (create intermediate folders if needed)
+      let parentFolderId = this.rootFolderId;
+      if (dirName && dirName !== '.') {
+        parentFolderId = await this._ensureFolder(dirName);
+      }
+
+      if (!parentFolderId) {
+        console.error(`[sync] Cannot determine parent folder for ${relativePath}`);
+        return;
+      }
+
+      if (isTextFile(relativePath)) {
+        await this._createTextDoc(absPath, relativePath, fileName, parentFolderId);
+      } else {
+        await this._uploadBinaryFile(absPath, relativePath, fileName, parentFolderId);
+      }
+    } finally {
+      this._creatingFiles.delete(relativePath);
+    }
+  }
+
+  /**
+   * Create a text document on Overleaf via REST API and join for OT editing.
+   */
+  async _createTextDoc(absPath, relativePath, fileName, parentFolderId) {
+    const content = fs.readFileSync(absPath, 'utf-8');
+
+    const url = `${this.baseUrl}/project/${this.projectId}/doc`;
+    const res = await httpPost(url, this.cookie, this.csrfToken, {
+      name: fileName,
+      parent_folder_id: parentFolderId,
+    });
+
+    if (res.status !== 200 && res.status !== 201) {
+      console.error(`[sync] Failed to create ${relativePath}: HTTP ${res.status}`);
+      return;
+    }
+
+    const newDoc = JSON.parse(res.body);
+    const docId = newDoc._id;
+
+    // Join the doc for OT editing
+    const { lines, version } = await this.socket.joinDoc(docId);
+    const serverContent = lines.join('\n');
+
+    this.docs.set(docId, {
+      path: relativePath,
+      version,
+      content: serverContent,
+      sending: false,
+      dirty: false,
+      pendingContent: null,
+      needsResync: false,
+    });
+    this.pathToDocId.set(relativePath, docId);
+
+    console.log(`[local→remote] Created ${relativePath} (${docId})`);
+
+    // Push local content if non-empty
+    if (content && content !== serverContent) {
+      await this._flushDoc(docId);
+    }
+  }
+
+  /**
+   * Upload a binary file to Overleaf via multipart upload.
+   */
+  async _uploadBinaryFile(absPath, relativePath, fileName, parentFolderId) {
+    const fileBuffer = fs.readFileSync(absPath);
+    const url = `${this.baseUrl}/project/${this.projectId}/upload?folder_id=${parentFolderId}`;
+    const res = await httpPostMultipart(url, this.cookie, this.csrfToken, fileName, fileBuffer);
+
+    if (res.status !== 200 && res.status !== 201) {
+      console.error(`[sync] Failed to upload ${relativePath}: HTTP ${res.status}`);
+      return;
+    }
+
+    const result = JSON.parse(res.body);
+    const fileId = result.entity_id || result._id || (result.entity && result.entity._id);
+
+    if (fileId) {
+      this.filePaths.set(fileId, relativePath);
+      this.pathToFileId.set(relativePath, fileId);
+    }
+
+    console.log(`[local→remote] Uploaded ${relativePath} (binary)`);
+  }
+
+  /**
+   * Re-upload a binary file when it changes locally.
+   */
+  async _handleBinaryUpdate(relativePath, oldFileId) {
+    if (this._creatingFiles.has(relativePath)) return;
+    this._creatingFiles.add(relativePath);
+
+    try {
+      const absPath = path.join(this.dir, relativePath);
+      const fileBuffer = fs.readFileSync(absPath);
+      const fileName = path.basename(relativePath);
+      const dirName = path.dirname(relativePath);
+
+      let parentFolderId = this.rootFolderId;
+      if (dirName && dirName !== '.') {
+        parentFolderId = await this._ensureFolder(dirName);
+      }
+
+      const url = `${this.baseUrl}/project/${this.projectId}/upload?folder_id=${parentFolderId}`;
+      const res = await httpPostMultipart(url, this.cookie, this.csrfToken, fileName, fileBuffer);
+
+      if (res.status !== 200 && res.status !== 201) {
+        console.error(`[sync] Failed to update binary ${relativePath}: HTTP ${res.status}`);
+        return;
+      }
+
+      const result = JSON.parse(res.body);
+      const newFileId = result.entity_id || result._id || (result.entity && result.entity._id);
+
+      if (newFileId && newFileId !== oldFileId) {
+        this.filePaths.delete(oldFileId);
+        this.filePaths.set(newFileId, relativePath);
+        this.pathToFileId.set(relativePath, newFileId);
+      }
+
+      console.log(`[local→remote] Updated ${relativePath} (binary)`);
+    } finally {
+      this._creatingFiles.delete(relativePath);
+    }
+  }
+
+  /**
+   * Ensure a folder path exists on the server, creating intermediate folders as needed.
+   * Returns the folderId for the deepest folder.
+   */
+  async _ensureFolder(folderRelPath) {
+    const existing = this.pathToFolderId.get(folderRelPath);
+    if (existing) return existing;
+
+    const parts = folderRelPath.split('/');
+    let currentPath = '';
+    let parentId = this.rootFolderId;
+
+    for (const part of parts) {
+      currentPath = currentPath ? currentPath + '/' + part : part;
+      const existingId = this.pathToFolderId.get(currentPath);
+      if (existingId) {
+        parentId = existingId;
+        continue;
+      }
+
+      // Create folder via REST API
+      const url = `${this.baseUrl}/project/${this.projectId}/folder`;
+      const res = await httpPost(url, this.cookie, this.csrfToken, {
+        name: part,
+        parent_folder_id: parentId,
+      });
+
+      if (res.status !== 200 && res.status !== 201) {
+        console.error(`[sync] Failed to create folder ${currentPath}: HTTP ${res.status}`);
+        return null;
+      }
+
+      const newFolder = JSON.parse(res.body);
+      parentId = newFolder._id;
+      this.pathToFolderId.set(currentPath, parentId);
+      console.log(`[local→remote] Created folder ${currentPath}`);
+    }
+
+    return parentId;
+  }
+
+  /**
+   * Delete a document or binary file on Overleaf when a local file is removed.
+   */
+  async _handleLocalDelete(relativePath) {
+    const docId = this.pathToDocId.get(relativePath);
+    if (docId) {
+      try {
+        const url = `${this.baseUrl}/project/${this.projectId}/doc/${docId}`;
+        const res = await httpDelete(url, this.cookie, this.csrfToken);
+        if (res.status === 200 || res.status === 204) {
+          console.log(`[local→remote] Deleted ${relativePath}`);
+        } else {
+          console.error(`[sync] Failed to delete ${relativePath}: HTTP ${res.status}`);
+        }
+      } catch (err) {
+        console.error(`[sync] Delete error for ${relativePath}: ${err.message}`);
+      }
+      this._cancelFlush(docId);
+      this.docs.delete(docId);
+      this.pathToDocId.delete(relativePath);
+      return;
+    }
+
+    const fileId = this.pathToFileId.get(relativePath);
+    if (fileId) {
+      try {
+        const url = `${this.baseUrl}/project/${this.projectId}/file/${fileId}`;
+        const res = await httpDelete(url, this.cookie, this.csrfToken);
+        if (res.status === 200 || res.status === 204) {
+          console.log(`[local→remote] Deleted ${relativePath} (binary)`);
+        } else {
+          console.error(`[sync] Failed to delete binary ${relativePath}: HTTP ${res.status}`);
+        }
+      } catch (err) {
+        console.error(`[sync] Delete error for ${relativePath}: ${err.message}`);
+      }
+      this.filePaths.delete(fileId);
+      this.pathToFileId.delete(relativePath);
+      return;
+    }
+
+    console.log(`[local] File deleted: ${relativePath} (untracked)`);
+  }
+
+  /**
+   * Handle a new doc created remotely — join and download.
+   */
+  async _handleRemoteDocCreate(parentFolderId, doc) {
+    const prefix = this._folderPathById(parentFolderId);
+    const relativePath = prefix ? prefix + '/' + doc.name : doc.name;
+
+    if (this.pathToDocId.has(relativePath)) return; // already tracked
+
+    try {
+      const { lines, version } = await this.socket.joinDoc(doc._id);
+      const content = lines.join('\n');
+
+      this.docs.set(doc._id, {
+        path: relativePath,
+        version,
+        content,
+        sending: false,
+        dirty: false,
+        pendingContent: null,
+        needsResync: false,
+      });
+      this.pathToDocId.set(relativePath, doc._id);
+
+      const absPath = path.join(this.dir, relativePath);
+      fs.mkdirSync(path.dirname(absPath), { recursive: true });
+      const release = this.watcher.suppress(absPath, content);
+      this._atomicWrite(absPath, content);
+      release();
+
+      console.log(`[remote→local] New doc ${relativePath} (v${version})`);
+    } catch (err) {
+      console.error(`[sync] Failed to sync new doc ${doc.name}: ${err.message}`);
+    }
+  }
+
+  /**
+   * Handle a new binary file created remotely — download.
+   */
+  async _handleRemoteFileCreate(parentFolderId, file) {
+    const prefix = this._folderPathById(parentFolderId);
+    const relativePath = prefix ? prefix + '/' + file.name : file.name;
+
+    if (this.pathToFileId.has(relativePath)) return; // already tracked
+
+    const absPath = path.join(this.dir, relativePath);
+    if (fs.existsSync(absPath)) return;
+
+    try {
+      const url = `${this.baseUrl}/project/${this.projectId}/file/${file._id}`;
+      const res = await httpGetBinary(url, this.cookie);
+      if (res.status === 200) {
+        fs.mkdirSync(path.dirname(absPath), { recursive: true });
+        const release = this.watcher.suppress(absPath);
+        fs.writeFileSync(absPath, res.body);
+        release();
+        this.filePaths.set(file._id, relativePath);
+        this.pathToFileId.set(relativePath, file._id);
+        console.log(`[remote→local] Downloaded ${relativePath} (binary)`);
+      }
+    } catch (err) {
+      console.error(`[sync] Failed to download ${file.name}: ${err.message}`);
+    }
+  }
+
+  /**
+   * Resolve folder ID to relative path.
+   */
+  _folderPathById(folderId) {
+    if (folderId === this.rootFolderId) return '';
+    for (const [folderPath, id] of this.pathToFolderId.entries()) {
+      if (id === folderId) return folderPath;
+    }
+    return '';
   }
 
   /**
    * Compute diff and send OT ops for a document.
-   * Only called when docState.sending is false.
+   * Reads file content and verifies stability before sending.
    */
   async _flushDoc(docId) {
     const docState = this.docs.get(docId);
@@ -270,6 +718,20 @@ class SyncEngine {
       newContent = fs.readFileSync(absPath, 'utf-8');
     } catch (err) {
       console.error(`[sync] Cannot read ${docState.path}: ${err.message}`);
+      return;
+    }
+
+    // Content stability check: re-read after a brief pause to catch mid-write states
+    await new Promise((r) => setTimeout(r, 50));
+    try {
+      const reread = fs.readFileSync(absPath, 'utf-8');
+      if (reread !== newContent) {
+        // File changed during stability check — reschedule
+        this._scheduleFlush(docId);
+        return;
+      }
+    } catch (err) {
+      // File may have been deleted
       return;
     }
 
@@ -296,6 +758,16 @@ class SyncEngine {
       console.error(`[sync] Failed to sync ${docState.path}: ${err.message}`);
       docState.sending = false;
       docState.pendingContent = null;
+    }
+  }
+
+  /**
+   * Cancel a pending flush timer for a document.
+   */
+  _cancelFlush(docId) {
+    if (this._flushTimers.has(docId)) {
+      clearTimeout(this._flushTimers.get(docId));
+      this._flushTimers.delete(docId);
     }
   }
 
@@ -346,7 +818,7 @@ class SyncEngine {
   }
 
   /**
-   * Cleanup: leave all docs.
+   * Cleanup: leave all docs and cancel pending timers.
    */
   cleanup() {
     for (const docId of this.docs.keys()) {
@@ -354,6 +826,10 @@ class SyncEngine {
         this.socket.leaveDoc(docId);
       } catch (e) { /* ignore */ }
     }
+    for (const timer of this._flushTimers.values()) {
+      clearTimeout(timer);
+    }
+    this._flushTimers.clear();
   }
 }
 

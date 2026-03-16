@@ -74,9 +74,10 @@ overleap sync
 ```
 
 1. Connects to Overleaf using the same WebSocket protocol as the browser editor
-2. Downloads all project files on first run
-3. Watches local files — edits are diffed and sent as OT operations
+2. Downloads all project files on first run; uploads local-only files to the server
+3. Watches local files — text edits are diffed and sent as OT operations, binary files are uploaded via multipart API
 4. Receives remote changes — applied to local files atomically
+5. New files/docs created by collaborators are auto-downloaded
 
 ## Commands
 
@@ -109,10 +110,15 @@ overleap sync
 2. DevTools → Application → Cookies
 3. Copy the full cookie string (or just the `overleaf_session2` value)
 
+## Features
+
+- **Text files** (`.tex`, `.bib`, `.sty`, etc.) — live OT sync, same protocol as the Overleaf editor
+- **Binary files** (images, PDFs, etc.) — auto upload/download/update via REST API
+- **AI-agent friendly** — flush debouncing and content stability checks prevent corrupted uploads from rapid edits
+- **Local-only file detection** — files that exist locally but not on the server are uploaded on initial sync
+
 ## Limitations
 
-- Text documents only for live sync (binary files are downloaded on initial sync)
-- Local file creation/deletion does not yet propagate to Overleaf
 - Requires a valid session cookie (no OAuth yet)
 
 ## License

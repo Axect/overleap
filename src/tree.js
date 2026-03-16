@@ -12,6 +12,9 @@ function flattenTree(rootFolder) {
   const pathDocs = new Map();   // relativePath → docId
   const filePaths = new Map();  // fileRefId → relativePath
   const pathFiles = new Map();  // relativePath → fileRefId
+  const folderPaths = new Map(); // folderId → relativePath
+  const pathFolders = new Map(); // relativePath → folderId
+  let rootFolderId = null;
 
   function walk(folders, prefix) {
     if (!Array.isArray(folders)) return;
@@ -21,6 +24,16 @@ function flattenTree(rootFolder) {
       const currentPrefix = folder.name === 'rootFolder' || !prefix && !folder.name
         ? ''
         : folderPath;
+
+      // Track folder IDs
+      if (folder._id) {
+        if (currentPrefix === '') {
+          rootFolderId = folder._id;
+        } else {
+          folderPaths.set(folder._id, currentPrefix);
+          pathFolders.set(currentPrefix, folder._id);
+        }
+      }
 
       // Process docs (editable text files)
       if (Array.isArray(folder.docs)) {
@@ -51,7 +64,7 @@ function flattenTree(rootFolder) {
   const folders = Array.isArray(rootFolder) ? rootFolder : [rootFolder];
   walk(folders, '');
 
-  return { docPaths, pathDocs, filePaths, pathFiles };
+  return { docPaths, pathDocs, filePaths, pathFiles, folderPaths, pathFolders, rootFolderId };
 }
 
 module.exports = { flattenTree };
