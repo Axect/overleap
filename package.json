@@ -19,7 +19,7 @@
   },
   "homepage": "https://github.com/Axect/overleap#readme",
   "bin": {
-    "overleap": "./bin/overleap.js"
+    "overleap": "bin/overleap.js"
   },
   "files": [
     "bin/",
