@@ -482,14 +482,36 @@ class SyncEngine {
 
   /**
    * Upload a binary file to Overleaf via multipart upload.
+   * Retries once after a delay on failure.
    */
-  async _uploadBinaryFile(absPath, relativePath, fileName, parentFolderId) {
+  async _uploadBinaryFile(absPath, relativePath, fileName, parentFolderId, _retryCount = 0) {
     const fileBuffer = fs.readFileSync(absPath);
+
+    if (fileBuffer.length === 0) {
+      if (_retryCount < 2) {
+        // File may still be writing — wait and retry
+        const delay = 500 * (_retryCount + 1);
+        console.warn(`[sync] ${relativePath} is 0 bytes, retrying in ${delay}ms...`);
+        await new Promise((r) => setTimeout(r, delay));
+        return this._uploadBinaryFile(absPath, relativePath, fileName, parentFolderId, _retryCount + 1);
+      }
+      console.error(`[sync] Skipping empty file ${relativePath}`);
+      return;
+    }
+
     const url = `${this.baseUrl}/project/${this.projectId}/upload?folder_id=${parentFolderId}`;
     const res = await httpPostMultipart(url, this.cookie, this.csrfToken, fileName, fileBuffer);
 
     if (res.status !== 200 && res.status !== 201) {
-      console.error(`[sync] Failed to upload ${relativePath}: HTTP ${res.status}${res.body ? ' — ' + res.body.slice(0, 200) : ''}`);
+      console.error(`[sync] Failed to upload ${relativePath} (${fileBuffer.length} bytes): HTTP ${res.status}`);
+      if (res.body) console.error(`[sync]   Response: ${res.body.slice(0, 500)}`);
+
+      // Retry once on transient failure
+      if (_retryCount < 1) {
+        console.log(`[sync] Retrying upload of ${relativePath} in 1s...`);
+        await new Promise((r) => setTimeout(r, 1000));
+        return this._uploadBinaryFile(absPath, relativePath, fileName, parentFolderId, _retryCount + 1);
+      }
       return;
     }
 
@@ -501,7 +523,7 @@ class SyncEngine {
       this.pathToFileId.set(relativePath, fileId);
     }
 
-    console.log(`[local→remote] Uploaded ${relativePath} (binary)`);
+    console.log(`[local→remote] Uploaded ${relativePath} (binary, ${fileBuffer.length} bytes)`);
   }
 
   /**
@@ -526,7 +548,8 @@ class SyncEngine {
       const res = await httpPostMultipart(url, this.cookie, this.csrfToken, fileName, fileBuffer);
 
       if (res.status !== 200 && res.status !== 201) {
-        console.error(`[sync] Failed to update binary ${relativePath}: HTTP ${res.status}${res.body ? ' — ' + res.body.slice(0, 200) : ''}`);
+        console.error(`[sync] Failed to update binary ${relativePath} (${fileBuffer.length} bytes): HTTP ${res.status}`);
+        if (res.body) console.error(`[sync]   Response: ${res.body.slice(0, 500)}`);
         return;
       }
 

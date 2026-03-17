@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.2.3] — 2026-03-17
+
+### Fixed
+
+- **Copy-paste upload reliability**: increased `awaitWriteFinish` stability threshold from 50ms to 500ms, preventing premature reads of partially-written files during copy-paste operations
+- **Zero-byte file handling**: files read as 0 bytes (still being written) are now retried up to 2 times with increasing delay instead of uploading empty content
+- **Transient upload failures**: binary uploads now retry once after 1s on HTTP error before giving up
+
+### Changed
+
+- Upload failure logs now include file size and full response body (up to 500 chars) for better diagnosis
+- Successful upload logs now show file size
+
 ## [0.2.2] — 2026-03-17
 
 ### Fixed
@@ -68,6 +81,7 @@
 - `.env` file support for configuration
 - Graceful shutdown on SIGINT/SIGTERM
 
+[0.2.3]: https://github.com/Axect/overleap/releases/tag/v0.2.3
 [0.2.2]: https://github.com/Axect/overleap/releases/tag/v0.2.2
 [0.2.1]: https://github.com/Axect/overleap/releases/tag/v0.2.1
 [0.2.0]: https://github.com/Axect/overleap/releases/tag/v0.2.0

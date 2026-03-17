@@ -40,8 +40,8 @@ class FileWatcher extends EventEmitter {
       persistent: true,
       ignoreInitial: true,
       awaitWriteFinish: {
-        stabilityThreshold: 50,
-        pollInterval: 20,
+        stabilityThreshold: 500,
+        pollInterval: 50,
       },
     });
 

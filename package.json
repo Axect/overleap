@@ -1,6 +1,6 @@
 {
   "name": "overleap",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Bidirectional real-time sync between Overleaf projects and local files",
   "author": "Tae-Geun Kim",
   "license": "MIT",
