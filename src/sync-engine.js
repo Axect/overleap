@@ -373,12 +373,14 @@ class SyncEngine {
       return;
     }
 
-    // Existing binary file — re-upload
+    // Existing binary file — re-upload on change, skip on add (already on server)
     const fileId = this.pathToFileId.get(relativePath);
-    if (fileId && type === 'change') {
-      this._handleBinaryUpdate(relativePath, fileId).catch((e) =>
-        console.error('[sync] Binary update error:', e.message)
-      );
+    if (fileId) {
+      if (type === 'change') {
+        this._handleBinaryUpdate(relativePath, fileId).catch((e) =>
+          console.error('[sync] Binary update error:', e.message)
+        );
+      }
       return;
     }
 
@@ -487,7 +489,7 @@ class SyncEngine {
     const res = await httpPostMultipart(url, this.cookie, this.csrfToken, fileName, fileBuffer);
 
     if (res.status !== 200 && res.status !== 201) {
-      console.error(`[sync] Failed to upload ${relativePath}: HTTP ${res.status}`);
+      console.error(`[sync] Failed to upload ${relativePath}: HTTP ${res.status}${res.body ? ' — ' + res.body.slice(0, 200) : ''}`);
       return;
     }
 
@@ -524,7 +526,7 @@ class SyncEngine {
       const res = await httpPostMultipart(url, this.cookie, this.csrfToken, fileName, fileBuffer);
 
       if (res.status !== 200 && res.status !== 201) {
-        console.error(`[sync] Failed to update binary ${relativePath}: HTTP ${res.status}`);
+        console.error(`[sync] Failed to update binary ${relativePath}: HTTP ${res.status}${res.body ? ' — ' + res.body.slice(0, 200) : ''}`);
         return;
       }
 

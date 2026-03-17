@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.2] — 2026-03-17
+
+### Fixed
+
+- **Binary file upload broken**: Overleaf's upload endpoint requires a `name` form field (`req.body.name`) for the display filename — added the missing multipart field to `httpPostMultipart`, fixing HTTP 422 `invalid_filename` errors on all binary uploads
+- **Spurious upload attempts on tracked binary files**: watcher `add` events on already-tracked binary files (e.g. after startup) no longer fall through to `_handleLocalCreate`, preventing unnecessary 422 errors
+
+### Changed
+
+- Upload failure logs now include the server response body (truncated to 200 chars) for easier diagnosis
+
 ## [0.2.1] — 2026-03-17
 
 ### Fixed
@@ -57,6 +68,7 @@
 - `.env` file support for configuration
 - Graceful shutdown on SIGINT/SIGTERM
 
+[0.2.2]: https://github.com/Axect/overleap/releases/tag/v0.2.2
 [0.2.1]: https://github.com/Axect/overleap/releases/tag/v0.2.1
 [0.2.0]: https://github.com/Axect/overleap/releases/tag/v0.2.0
 [0.1.0]: https://github.com/Axect/overleap/releases/tag/v0.1.0

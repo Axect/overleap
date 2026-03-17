@@ -206,13 +206,19 @@ function httpPostMultipart(url, cookie, csrfToken, fileName, fileBuffer) {
     const httpModule = parsed.protocol === 'http:' ? http : https;
     const boundary = '----overleap' + crypto.randomBytes(16).toString('hex');
 
-    const header = Buffer.from(
+    // Overleaf requires a "name" form field (req.body.name) for the display filename
+    const namePart = Buffer.from(
+      `--${boundary}\r\n` +
+      `Content-Disposition: form-data; name="name"\r\n\r\n` +
+      `${fileName}\r\n`
+    );
+    const filePart = Buffer.from(
       `--${boundary}\r\n` +
       `Content-Disposition: form-data; name="qqfile"; filename="${fileName}"\r\n` +
       `Content-Type: application/octet-stream\r\n\r\n`
     );
     const footer = Buffer.from(`\r\n--${boundary}--\r\n`);
-    const body = Buffer.concat([header, fileBuffer, footer]);
+    const body = Buffer.concat([namePart, filePart, fileBuffer, footer]);
 
     const options = {
       hostname: parsed.hostname,
