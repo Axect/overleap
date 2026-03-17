@@ -210,6 +210,7 @@ class SocketManager extends EventEmitter {
     };
 
     // Hash the final content directly (no re-applying ops — avoids divergence)
+    // Note: Overleaf uses JS string length (not byte length) in the git-blob prefix
     if (contentAfterOps !== undefined && contentAfterOps !== null) {
       update.hash = crypto
         .createHash('sha1')

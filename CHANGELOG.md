@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.2.1] — 2026-03-17
+
+### Fixed
+
+- **OT version tracking**: fixed stale version numbers causing "Delete component does not match" errors — `docState.version` now correctly increments after self-update acks and remote updates, matching the ShareJS OT protocol
+- **Timeout handling**: send timeouts now enter an "uncertain" state instead of immediately clearing pending state, preventing content drift and duplicate sends when the server applies ops but the callback is lost
+- **Pre-send race condition**: added snapshot fence in `_flushDoc` to detect concurrent remote updates arriving during the 50ms content stability check
+
+### Changed
+
+- Replaced boolean `sending` flag and `pendingContent` string with structured `pending` record (`{ baseVersion, targetContent, sentAt, sendEpoch }`) for explicit in-flight operation tracking
+- Added monotonic `sendEpoch` counter to prevent stale ack confusion after resyncs
+- Self-update acks are now validated: stray/duplicate acks with no pending send are silently ignored instead of corrupting version state
+- Non-timeout send failures now trigger immediate resync instead of silently clearing state
+
 ## [0.2.0] — 2026-03-17
 
 ### Added
@@ -42,5 +57,6 @@
 - `.env` file support for configuration
 - Graceful shutdown on SIGINT/SIGTERM
 
+[0.2.1]: https://github.com/Axect/overleap/releases/tag/v0.2.1
 [0.2.0]: https://github.com/Axect/overleap/releases/tag/v0.2.0
 [0.1.0]: https://github.com/Axect/overleap/releases/tag/v0.1.0

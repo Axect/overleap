@@ -37,10 +37,12 @@ class SyncEngine {
     this.projectId = projectId;
     this.csrfToken = csrfToken;
 
-    // State per document: docId → { path, version, content, sending, dirty, pendingContent, needsResync }
+    // State per document: docId → { path, version, content, pending, dirty, needsResync }
     // content: last server-confirmed content
-    // pendingContent: content we sent but haven't received ack for
+    // pending: null (idle) or { baseVersion, targetContent, sentAt, sendEpoch } (awaiting ack)
     this.docs = new Map();
+    // Monotonic send epoch counter — survives resyncs, prevents stale ack confusion
+    this._sendEpoch = 0;
     // Reverse map: relativePath → docId
     this.pathToDocId = new Map();
     // Binary files: fileRefId → relativePath
@@ -69,8 +71,7 @@ class SyncEngine {
       if (err && err.doc) {
         const docState = this.docs.get(err.doc);
         if (docState) {
-          docState.sending = false;
-          docState.pendingContent = null;
+          docState.pending = null;
           this._resyncDoc(err.doc).catch((e) => console.error('[sync] Re-sync error:', e.message));
         }
       }
@@ -148,9 +149,8 @@ class SyncEngine {
           path: relPath,
           version,
           content,
-          sending: false,
+          pending: null,
           dirty: false,
-          pendingContent: null,
           needsResync: false,
         });
         this.pathToDocId.set(relPath, docId);
@@ -280,22 +280,25 @@ class SyncEngine {
 
     // Ack for our own update (no op field, or empty op)
     if (!update.op || update.op.length === 0) {
-      docState.version = update.v;
-      docState.sending = false;
+      // Validate: ack must correspond to a pending send
+      if (!docState.pending) {
+        // Stray/duplicate ack with no pending send — ignore
+        return;
+      }
+      // Our update was applied — advance version past it
+      docState.version++;
+      const committedContent = docState.pending.targetContent;
+      docState.pending = null;
 
       if (docState.needsResync) {
         docState.needsResync = false;
-        docState.pendingContent = null;
         docState.dirty = false;
         this._resyncDoc(update.doc).catch((e) => console.error('[sync] Re-sync error:', e.message));
         return;
       }
 
       // Commit the pending content as server-confirmed
-      if (docState.pendingContent !== null) {
-        docState.content = docState.pendingContent;
-        docState.pendingContent = null;
-      }
+      docState.content = committedContent;
 
       if (docState.dirty) {
         docState.dirty = false;
@@ -305,17 +308,16 @@ class SyncEngine {
     }
 
     // Remote change from another user
-    if (docState.sending) {
-      docState.version = update.v;
+    if (docState.pending) {
+      docState.version = update.v + 1;
       docState.needsResync = true;
       console.log(`[sync] Conflict detected on ${docState.path} — will re-sync after ack`);
       return;
     }
 
-    // M7: version gap detection
-    const expectedVersion = docState.version + 1;
-    if (update.v !== expectedVersion) {
-      console.log(`[sync] Version gap on ${docState.path}: expected v${expectedVersion}, got v${update.v} — re-syncing`);
+    // M7: version gap detection — update.v should equal our current version
+    if (update.v !== docState.version) {
+      console.log(`[sync] Version gap on ${docState.path}: expected v${docState.version}, got v${update.v} — re-syncing`);
       this._resyncDoc(update.doc).catch((e) => console.error('[sync] Re-sync error:', e.message));
       return;
     }
@@ -332,7 +334,7 @@ class SyncEngine {
     }
 
     docState.content = content;
-    docState.version = update.v;
+    docState.version = update.v + 1;
 
     // Write to local file (H4: suppress with content hash)
     const absPath = path.join(this.dir, docState.path);
@@ -362,7 +364,7 @@ class SyncEngine {
       const docState = this.docs.get(docId);
       if (!docState) return;
 
-      if (docState.sending) {
+      if (docState.pending) {
         docState.dirty = true;
         return;
       }
@@ -462,9 +464,8 @@ class SyncEngine {
       path: relativePath,
       version,
       content: serverContent,
-      sending: false,
+      pending: null,
       dirty: false,
-      pendingContent: null,
       needsResync: false,
     });
     this.pathToDocId.set(relativePath, docId);
@@ -644,9 +645,8 @@ class SyncEngine {
         path: relativePath,
         version,
         content,
-        sending: false,
+        pending: null,
         dirty: false,
-        pendingContent: null,
         needsResync: false,
       });
       this.pathToDocId.set(relativePath, doc._id);
@@ -709,7 +709,7 @@ class SyncEngine {
    */
   async _flushDoc(docId) {
     const docState = this.docs.get(docId);
-    if (!docState || docState.sending) return;
+    if (!docState || docState.pending) return;
 
     const absPath = path.join(this.dir, docState.path);
 
@@ -720,6 +720,10 @@ class SyncEngine {
       console.error(`[sync] Cannot read ${docState.path}: ${err.message}`);
       return;
     }
+
+    // Snapshot fence: capture state before async gap to detect concurrent remote updates
+    const snapshotVersion = docState.version;
+    const snapshotContent = docState.content;
 
     // Content stability check: re-read after a brief pause to catch mid-write states
     await new Promise((r) => setTimeout(r, 50));
@@ -735,6 +739,12 @@ class SyncEngine {
       return;
     }
 
+    // Snapshot fence: abort if remote update changed docState during the await
+    if (docState.version !== snapshotVersion || docState.content !== snapshotContent) {
+      this._scheduleFlush(docId);
+      return;
+    }
+
     if (newContent === docState.content) {
       docState.dirty = false;
       return;
@@ -746,8 +756,13 @@ class SyncEngine {
       return;
     }
 
-    docState.sending = true;
-    docState.pendingContent = newContent;
+    const epoch = ++this._sendEpoch;
+    docState.pending = {
+      baseVersion: docState.version,
+      targetContent: newContent,
+      sentAt: Date.now(),
+      sendEpoch: epoch,
+    };
 
     console.log(`[local→remote] ${docState.path} (${ops.length} ops, v${docState.version})`);
 
@@ -755,9 +770,25 @@ class SyncEngine {
       await this.socket.applyOtUpdate(docId, ops, docState.version, newContent);
       // Content will be committed when ack arrives in _onRemoteUpdate
     } catch (err) {
-      console.error(`[sync] Failed to sync ${docState.path}: ${err.message}`);
-      docState.sending = false;
-      docState.pendingContent = null;
+      const isTimeout = err.message && err.message.includes('timeout');
+      if (isTimeout && docState.pending && docState.pending.sendEpoch === epoch) {
+        // Timeout: enter uncertain state — server may have applied the ops.
+        // Keep pending record alive; start grace timer for late ack or forced resync.
+        console.log(`[sync] Timeout on ${docState.path} — entering uncertain state, waiting for late ack...`);
+        setTimeout(() => {
+          // If still waiting for this same send after grace period, force resync
+          if (docState.pending && docState.pending.sendEpoch === epoch) {
+            console.log(`[sync] Grace period expired for ${docState.path} — forcing re-sync`);
+            docState.pending = null;
+            this._resyncDoc(docId).catch((e) => console.error('[sync] Re-sync error:', e.message));
+          }
+        }, 5000);
+      } else {
+        // Non-timeout error: clear immediately and resync
+        console.error(`[sync] Failed to sync ${docState.path}: ${err.message}`);
+        docState.pending = null;
+        this._resyncDoc(docId).catch((e) => console.error('[sync] Re-sync error:', e.message));
+      }
     }
   }
 
@@ -787,8 +818,7 @@ class SyncEngine {
 
       docState.version = version;
       docState.content = serverContent;
-      docState.sending = false;
-      docState.pendingContent = null;
+      docState.pending = null;
       docState.needsResync = false;
 
       const absPath = path.join(this.dir, docState.path);
