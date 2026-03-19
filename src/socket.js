@@ -93,6 +93,7 @@ class SocketManager extends EventEmitter {
       });
 
       const timeout = setTimeout(() => {
+        try { this.socket.disconnect(); } catch (e) { /* ignore */ }
         reject(new Error('Connection timeout (15s)'));
       }, 15000);
 
@@ -125,11 +126,13 @@ class SocketManager extends EventEmitter {
 
       this.socket.on('connect_failed', () => {
         clearTimeout(timeout);
+        try { this.socket.disconnect(); } catch (e) { /* ignore */ }
         reject(new Error('Socket.IO connection failed'));
       });
 
       this.socket.on('error', (err) => {
         clearTimeout(timeout);
+        try { this.socket.disconnect(); } catch (e) { /* ignore */ }
         reject(new Error(String(err)));
       });
     });

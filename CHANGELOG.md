@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.2.4] — 2026-03-19
+
+### Fixed
+
+- **Binary file delete/re-upload loop**: added path-based watcher suppression for binary files (no content hash available) — suppresses all event types including `unlink`, preventing the loop when multiple binary files change simultaneously
+- **Socket connection leak**: `connect()` timeout, `error`, and `connect_failed` handlers now disconnect the socket before rejecting
+- **Reconnect socket leak**: old `socketManager` is disconnected before creating a new one during reconnect
+- **Concurrent folder creation**: `_ensureFolder` deduplicates simultaneous requests for the same folder path via in-flight promise tracking
+- **Zero-byte binary update**: `_handleBinaryUpdate` skips 0-byte files instead of uploading empty content
+- **Remote file create race**: map entries (`filePaths`, `pathToFileId`) are now set before file write in `_handleRemoteFileCreate`, so concurrent events see the file as tracked
+- **JSON parse safety**: 4 unguarded `JSON.parse` calls (create doc, upload, update, create folder responses) wrapped in try/catch
+- **OT op branching**: `else if` for `op.i` prevents theoretical double-application when an op has both `d` and `i` fields
+- **Filename sanitization**: `sanitizeFileName` strips control characters and quotes before multipart upload headers
+
+### Added
+
+- **Concurrent binary upload throttling**: `Semaphore(3)` limits simultaneous binary uploads, preventing server overload
+- **Auth token auto-refresh**: `_refreshAuthIfNeeded` retries on HTTP 403 after refreshing cookie/CSRF via `onAuthExpired` callback
+- **O(1) folder path lookup**: `_folderIdToPath` reverse map replaces O(n) scan in `_folderPathById`
+- **Test infrastructure**: 38 tests via `node:test` covering `computeOps`, `flattenTree`, watcher suppression (including unlink), and sync-engine core logic
+- Centralized `IGNORE_PATTERNS` in `constants.js`, shared between watcher and sync-engine
+
+### Changed
+
+- `listProjects()` now calls `updateCookies` for session stickiness
+- `require('fs')` moved to module top-level in watcher (was inlined in `_handleEvent`)
+
 ## [0.2.3] — 2026-03-17
 
 ### Fixed
@@ -81,6 +108,7 @@
 - `.env` file support for configuration
 - Graceful shutdown on SIGINT/SIGTERM
 
+[0.2.4]: https://github.com/Axect/overleap/releases/tag/v0.2.4
 [0.2.3]: https://github.com/Axect/overleap/releases/tag/v0.2.3
 [0.2.2]: https://github.com/Axect/overleap/releases/tag/v0.2.2
 [0.2.1]: https://github.com/Axect/overleap/releases/tag/v0.2.1

@@ -200,21 +200,27 @@ function httpDelete(url, cookie, csrfToken) {
   });
 }
 
+function sanitizeFileName(name) {
+  // Remove control characters (U+0000–U+001F, U+007F) and quotes
+  return name.replace(/[\x00-\x1f\x7f"'\\]/g, '');
+}
+
 function httpPostMultipart(url, cookie, csrfToken, fileName, fileBuffer) {
   return new Promise((resolve, reject) => {
     const parsed = new URL(url);
     const httpModule = parsed.protocol === 'http:' ? http : https;
     const boundary = '----overleap' + crypto.randomBytes(16).toString('hex');
+    const safeName = sanitizeFileName(fileName);
 
     // Overleaf requires a "name" form field (req.body.name) for the display filename
     const namePart = Buffer.from(
       `--${boundary}\r\n` +
       `Content-Disposition: form-data; name="name"\r\n\r\n` +
-      `${fileName}\r\n`
+      `${safeName}\r\n`
     );
     const filePart = Buffer.from(
       `--${boundary}\r\n` +
-      `Content-Disposition: form-data; name="qqfile"; filename="${fileName}"\r\n` +
+      `Content-Disposition: form-data; name="qqfile"; filename="${safeName}"\r\n` +
       `Content-Type: application/octet-stream\r\n\r\n`
     );
     const footer = Buffer.from(`\r\n--${boundary}--\r\n`);

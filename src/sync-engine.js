@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const { computeOps } = require('./diff');
 const { flattenTree } = require('./tree');
+const { IGNORE_PATTERNS } = require('./constants');
 const { httpPost, httpDelete, httpPostMultipart, httpGetBinary } = require('./auth');
 
 const TEXT_EXTENSIONS = new Set([
@@ -27,8 +28,35 @@ function isTextFile(relativePath) {
   return ext !== '' && TEXT_EXTENSIONS.has(ext);
 }
 
+class Semaphore {
+  constructor(max) {
+    this._max = max;
+    this._count = 0;
+    this._queue = [];
+  }
+
+  acquire() {
+    return new Promise((resolve) => {
+      if (this._count < this._max) {
+        this._count++;
+        resolve();
+      } else {
+        this._queue.push(resolve);
+      }
+    });
+  }
+
+  release() {
+    this._count--;
+    if (this._queue.length > 0) {
+      this._count++;
+      this._queue.shift()();
+    }
+  }
+}
+
 class SyncEngine {
-  constructor(socketManager, watcher, dir, baseUrl, cookie, projectId, csrfToken) {
+  constructor(socketManager, watcher, dir, baseUrl, cookie, projectId, csrfToken, opts = {}) {
     this.socket = socketManager;
     this.watcher = watcher;
     this.dir = path.resolve(dir);
@@ -36,26 +64,36 @@ class SyncEngine {
     this.cookie = cookie;
     this.projectId = projectId;
     this.csrfToken = csrfToken;
+    this.onAuthExpired = opts.onAuthExpired || null;
 
-    // State per document: docId → { path, version, content, pending, dirty, needsResync }
+    // State per document: docId -> { path, version, content, pending, dirty, needsResync }
     // content: last server-confirmed content
     // pending: null (idle) or { baseVersion, targetContent, sentAt, sendEpoch } (awaiting ack)
     this.docs = new Map();
     // Monotonic send epoch counter — survives resyncs, prevents stale ack confusion
     this._sendEpoch = 0;
-    // Reverse map: relativePath → docId
+    // Reverse map: relativePath -> docId
     this.pathToDocId = new Map();
-    // Binary files: fileRefId → relativePath
+    // Binary files: fileRefId -> relativePath
     this.filePaths = new Map();
-    // Reverse map: relativePath → fileRefId
+    // Reverse map: relativePath -> fileRefId
     this.pathToFileId = new Map();
-    // Folder tracking: relativePath → folderId
+    // Folder tracking: relativePath -> folderId
     this.pathToFolderId = new Map();
+    // Reverse map: folderId -> relativePath (O(1) lookup)
+    this._folderIdToPath = new Map();
     this.rootFolderId = null;
     // Prevent duplicate creation/upload attempts
     this._creatingFiles = new Set();
+    // Prevent concurrent folder creation for the same path
+    this._creatingFolders = new Map();
+    // Track file entity IDs being replaced by _handleBinaryUpdate
+    // so removeEntity can skip deleting the local file during replacement
+    this._replacingFileIds = new Set();
     // Per-doc flush debounce timers (rapid edit protection)
     this._flushTimers = new Map();
+    // Limit concurrent binary uploads
+    this._binarySemaphore = new Semaphore(3);
 
     // H2: store bound handler reference for cleanup
     this._onFileChange = (event) => this._onLocalChange(event);
@@ -64,7 +102,7 @@ class SyncEngine {
   }
 
   _setupHandlers() {
-    // Remote → Local: OT updates from server
+    // Remote -> Local: OT updates from server
     this.socket.on('otUpdateApplied', (update) => this._onRemoteUpdate(update));
     this.socket.on('otUpdateError', (err) => {
       console.error('[sync] OT update error:', err);
@@ -104,6 +142,12 @@ class SyncEngine {
 
       const filePath = this.filePaths.get(entityId);
       if (filePath) {
+        // If this entity is being replaced by _handleBinaryUpdate, skip
+        // the local file deletion — the file has been updated, not removed.
+        if (this._replacingFileIds.has(entityId)) {
+          this.filePaths.delete(entityId);
+          return;
+        }
         console.log(`[sync] Binary file removed on server: ${filePath}`);
         const absPath = path.join(this.dir, filePath);
         const release = this.watcher.suppress(absPath);
@@ -113,7 +157,7 @@ class SyncEngine {
       }
     });
 
-    // Local → Remote: file changes (H2: use stored reference)
+    // Local -> Remote: file changes (H2: use stored reference)
     this.watcher.on('file-change', this._onFileChange);
   }
 
@@ -128,12 +172,20 @@ class SyncEngine {
    * Initial sync: join all docs, write to local filesystem.
    */
   async initialSync(project) {
-    const { docPaths, pathDocs, filePaths, pathFiles, pathFolders, rootFolderId } = flattenTree(project.rootFolder);
+    const { docPaths, pathDocs, filePaths, pathFiles, folderPaths, pathFolders, rootFolderId } = flattenTree(project.rootFolder);
 
     this.filePaths = filePaths;
     this.pathToFileId = pathFiles;
     this.pathToFolderId = pathFolders;
     this.rootFolderId = rootFolderId;
+
+    // Build reverse map: folderId -> relativePath
+    this._folderIdToPath = new Map();
+    if (folderPaths) {
+      for (const [folderId, folderPath] of folderPaths.entries()) {
+        this._folderIdToPath.set(folderId, folderPath);
+      }
+    }
 
     fs.mkdirSync(this.dir, { recursive: true });
 
@@ -163,9 +215,9 @@ class SyncEngine {
         this._atomicWrite(absPath, content);
         release();
 
-        console.log(`  ✓ ${relPath} (v${version})`);
+        console.log(`  \u2713 ${relPath} (v${version})`);
       } catch (err) {
-        console.error(`  ✗ ${relPath}: ${err.message}`);
+        console.error(`  \u2717 ${relPath}: ${err.message}`);
       }
     }
 
@@ -191,12 +243,12 @@ class SyncEngine {
             fs.writeFileSync(absPath, res.body);
             release();
             downloaded++;
-            console.log(`  ✓ ${relPath} (binary)`);
+            console.log(`  \u2713 ${relPath} (binary)`);
           } else {
-            console.error(`  ✗ ${relPath}: HTTP ${res.status}`);
+            console.error(`  \u2717 ${relPath}: HTTP ${res.status}`);
           }
         } catch (err) {
-          console.error(`  ✗ ${relPath}: ${err.message}`);
+          console.error(`  \u2717 ${relPath}: ${err.message}`);
         }
       }
 
@@ -227,26 +279,16 @@ class SyncEngine {
       try {
         await this._handleLocalCreate(relativePath);
       } catch (err) {
-        console.error(`  ✗ ${relativePath}: ${err.message}`);
+        console.error(`  \u2717 ${relativePath}: ${err.message}`);
       }
     }
   }
 
   /**
-   * Recursively scan a directory, returning relative paths (respecting watcher ignore patterns).
+   * Recursively scan a directory, returning relative paths (respecting ignore patterns).
    */
   _scanDir(base, prefix) {
     const results = [];
-    const ignorePatterns = [
-      /(^|[/\\])\../,
-      /node_modules/,
-      /\.git/,
-      /\.env(\.|$)/,
-      /~$/,
-      /\.swp$/,
-      /\.swo$/,
-      /\.tmp\.\d+$/,
-    ];
 
     let entries;
     try {
@@ -257,7 +299,7 @@ class SyncEngine {
 
     for (const entry of entries) {
       const rel = prefix ? prefix + '/' + entry.name : entry.name;
-      if (ignorePatterns.some((p) => p.test(rel))) continue;
+      if (IGNORE_PATTERNS.some((p) => p.test(rel))) continue;
 
       if (entry.isDirectory()) {
         results.push(...this._scanDir(base, rel));
@@ -270,7 +312,7 @@ class SyncEngine {
   }
 
   /**
-   * Handle remote OT update → apply to local file.
+   * Handle remote OT update -> apply to local file.
    */
   _onRemoteUpdate(update) {
     if (!update || !update.doc) return;
@@ -327,8 +369,7 @@ class SyncEngine {
     for (const op of update.op) {
       if (op.d) {
         content = content.slice(0, op.p) + content.slice(op.p + op.d.length);
-      }
-      if (op.i) {
+      } else if (op.i) {
         content = content.slice(0, op.p) + op.i + content.slice(op.p);
       }
     }
@@ -342,11 +383,11 @@ class SyncEngine {
     this._atomicWrite(absPath, content);
     release();
 
-    console.log(`[remote→local] ${docState.path} (v${update.v})`);
+    console.log(`[remote\u2192local] ${docState.path} (v${update.v})`);
   }
 
   /**
-   * Handle local file change → queue OT update, create, or delete on server.
+   * Handle local file change -> queue OT update, create, or delete on server.
    */
   _onLocalChange(event) {
     const { type, relativePath } = event;
@@ -450,12 +491,22 @@ class SyncEngine {
       parent_folder_id: parentFolderId,
     });
 
+    if (res.status === 403 && await this._refreshAuthIfNeeded()) {
+      return this._createTextDoc(absPath, relativePath, fileName, parentFolderId);
+    }
+
     if (res.status !== 200 && res.status !== 201) {
       console.error(`[sync] Failed to create ${relativePath}: HTTP ${res.status}`);
       return;
     }
 
-    const newDoc = JSON.parse(res.body);
+    let newDoc;
+    try {
+      newDoc = JSON.parse(res.body);
+    } catch (e) {
+      console.error(`[sync] Failed to parse create-doc response for ${relativePath}: ${e.message}`);
+      return;
+    }
     const docId = newDoc._id;
 
     // Join the doc for OT editing
@@ -472,7 +523,7 @@ class SyncEngine {
     });
     this.pathToDocId.set(relativePath, docId);
 
-    console.log(`[local→remote] Created ${relativePath} (${docId})`);
+    console.log(`[local\u2192remote] Created ${relativePath} (${docId})`);
 
     // Push local content if non-empty
     if (content && content !== serverContent) {
@@ -499,31 +550,48 @@ class SyncEngine {
       return;
     }
 
-    const url = `${this.baseUrl}/project/${this.projectId}/upload?folder_id=${parentFolderId}`;
-    const res = await httpPostMultipart(url, this.cookie, this.csrfToken, fileName, fileBuffer);
+    await this._binarySemaphore.acquire();
+    try {
+      const url = `${this.baseUrl}/project/${this.projectId}/upload?folder_id=${parentFolderId}`;
+      const res = await httpPostMultipart(url, this.cookie, this.csrfToken, fileName, fileBuffer);
 
-    if (res.status !== 200 && res.status !== 201) {
-      console.error(`[sync] Failed to upload ${relativePath} (${fileBuffer.length} bytes): HTTP ${res.status}`);
-      if (res.body) console.error(`[sync]   Response: ${res.body.slice(0, 500)}`);
-
-      // Retry once on transient failure
-      if (_retryCount < 1) {
-        console.log(`[sync] Retrying upload of ${relativePath} in 1s...`);
-        await new Promise((r) => setTimeout(r, 1000));
-        return this._uploadBinaryFile(absPath, relativePath, fileName, parentFolderId, _retryCount + 1);
+      if (res.status === 403 && await this._refreshAuthIfNeeded()) {
+        this._binarySemaphore.release();
+        return this._uploadBinaryFile(absPath, relativePath, fileName, parentFolderId, _retryCount);
       }
-      return;
+
+      if (res.status !== 200 && res.status !== 201) {
+        console.error(`[sync] Failed to upload ${relativePath} (${fileBuffer.length} bytes): HTTP ${res.status}`);
+        if (res.body) console.error(`[sync]   Response: ${res.body.slice(0, 500)}`);
+
+        // Retry once on transient failure
+        if (_retryCount < 1) {
+          console.log(`[sync] Retrying upload of ${relativePath} in 1s...`);
+          await new Promise((r) => setTimeout(r, 1000));
+          this._binarySemaphore.release();
+          return this._uploadBinaryFile(absPath, relativePath, fileName, parentFolderId, _retryCount + 1);
+        }
+        return;
+      }
+
+      let result;
+      try {
+        result = JSON.parse(res.body);
+      } catch (e) {
+        console.error(`[sync] Failed to parse upload response for ${relativePath}: ${e.message}`);
+        return;
+      }
+      const fileId = result.entity_id || result._id || (result.entity && result.entity._id);
+
+      if (fileId) {
+        this.filePaths.set(fileId, relativePath);
+        this.pathToFileId.set(relativePath, fileId);
+      }
+
+      console.log(`[local\u2192remote] Uploaded ${relativePath} (binary, ${fileBuffer.length} bytes)`);
+    } finally {
+      this._binarySemaphore.release();
     }
-
-    const result = JSON.parse(res.body);
-    const fileId = result.entity_id || result._id || (result.entity && result.entity._id);
-
-    if (fileId) {
-      this.filePaths.set(fileId, relativePath);
-      this.pathToFileId.set(relativePath, fileId);
-    }
-
-    console.log(`[local→remote] Uploaded ${relativePath} (binary, ${fileBuffer.length} bytes)`);
   }
 
   /**
@@ -532,10 +600,19 @@ class SyncEngine {
   async _handleBinaryUpdate(relativePath, oldFileId) {
     if (this._creatingFiles.has(relativePath)) return;
     this._creatingFiles.add(relativePath);
+    // Mark oldFileId as being replaced so removeEntity skips local file deletion
+    this._replacingFileIds.add(oldFileId);
 
     try {
       const absPath = path.join(this.dir, relativePath);
       const fileBuffer = fs.readFileSync(absPath);
+
+      // Skip 0-byte files (file may still be writing)
+      if (fileBuffer.length === 0) {
+        console.warn(`[sync] Skipping 0-byte binary update for ${relativePath}`);
+        return;
+      }
+
       const fileName = path.basename(relativePath);
       const dirName = path.dirname(relativePath);
 
@@ -544,26 +621,46 @@ class SyncEngine {
         parentFolderId = await this._ensureFolder(dirName);
       }
 
-      const url = `${this.baseUrl}/project/${this.projectId}/upload?folder_id=${parentFolderId}`;
-      const res = await httpPostMultipart(url, this.cookie, this.csrfToken, fileName, fileBuffer);
+      await this._binarySemaphore.acquire();
+      try {
+        const url = `${this.baseUrl}/project/${this.projectId}/upload?folder_id=${parentFolderId}`;
+        const res = await httpPostMultipart(url, this.cookie, this.csrfToken, fileName, fileBuffer);
 
-      if (res.status !== 200 && res.status !== 201) {
-        console.error(`[sync] Failed to update binary ${relativePath} (${fileBuffer.length} bytes): HTTP ${res.status}`);
-        if (res.body) console.error(`[sync]   Response: ${res.body.slice(0, 500)}`);
-        return;
+        if (res.status === 403 && await this._refreshAuthIfNeeded()) {
+          // Retry after auth refresh
+          this._binarySemaphore.release();
+          this._replacingFileIds.delete(oldFileId);
+          this._creatingFiles.delete(relativePath);
+          return this._handleBinaryUpdate(relativePath, oldFileId);
+        }
+
+        if (res.status !== 200 && res.status !== 201) {
+          console.error(`[sync] Failed to update binary ${relativePath} (${fileBuffer.length} bytes): HTTP ${res.status}`);
+          if (res.body) console.error(`[sync]   Response: ${res.body.slice(0, 500)}`);
+          return;
+        }
+
+        let result;
+        try {
+          result = JSON.parse(res.body);
+        } catch (e) {
+          console.error(`[sync] Failed to parse update response for ${relativePath}: ${e.message}`);
+          return;
+        }
+        const newFileId = result.entity_id || result._id || (result.entity && result.entity._id);
+
+        if (newFileId && newFileId !== oldFileId) {
+          this.filePaths.delete(oldFileId);
+          this.filePaths.set(newFileId, relativePath);
+          this.pathToFileId.set(relativePath, newFileId);
+        }
+
+        console.log(`[local\u2192remote] Updated ${relativePath} (binary)`);
+      } finally {
+        this._binarySemaphore.release();
       }
-
-      const result = JSON.parse(res.body);
-      const newFileId = result.entity_id || result._id || (result.entity && result.entity._id);
-
-      if (newFileId && newFileId !== oldFileId) {
-        this.filePaths.delete(oldFileId);
-        this.filePaths.set(newFileId, relativePath);
-        this.pathToFileId.set(relativePath, newFileId);
-      }
-
-      console.log(`[local→remote] Updated ${relativePath} (binary)`);
     } finally {
+      this._replacingFileIds.delete(oldFileId);
       this._creatingFiles.delete(relativePath);
     }
   }
@@ -571,11 +668,29 @@ class SyncEngine {
   /**
    * Ensure a folder path exists on the server, creating intermediate folders as needed.
    * Returns the folderId for the deepest folder.
+   * Uses _creatingFolders to prevent concurrent duplicate creation.
    */
   async _ensureFolder(folderRelPath) {
     const existing = this.pathToFolderId.get(folderRelPath);
     if (existing) return existing;
 
+    // If another call is already creating this folder, wait for it
+    const inflight = this._creatingFolders.get(folderRelPath);
+    if (inflight) return inflight;
+
+    const promise = this._createFolder(folderRelPath);
+    this._creatingFolders.set(folderRelPath, promise);
+    try {
+      return await promise;
+    } finally {
+      this._creatingFolders.delete(folderRelPath);
+    }
+  }
+
+  /**
+   * Internal: actually create folder hierarchy on the server.
+   */
+  async _createFolder(folderRelPath) {
     const parts = folderRelPath.split('/');
     let currentPath = '';
     let parentId = this.rootFolderId;
@@ -600,10 +715,17 @@ class SyncEngine {
         return null;
       }
 
-      const newFolder = JSON.parse(res.body);
+      let newFolder;
+      try {
+        newFolder = JSON.parse(res.body);
+      } catch (e) {
+        console.error(`[sync] Failed to parse folder response for ${currentPath}: ${e.message}`);
+        return null;
+      }
       parentId = newFolder._id;
       this.pathToFolderId.set(currentPath, parentId);
-      console.log(`[local→remote] Created folder ${currentPath}`);
+      this._folderIdToPath.set(parentId, currentPath);
+      console.log(`[local\u2192remote] Created folder ${currentPath}`);
     }
 
     return parentId;
@@ -619,7 +741,7 @@ class SyncEngine {
         const url = `${this.baseUrl}/project/${this.projectId}/doc/${docId}`;
         const res = await httpDelete(url, this.cookie, this.csrfToken);
         if (res.status === 200 || res.status === 204) {
-          console.log(`[local→remote] Deleted ${relativePath}`);
+          console.log(`[local\u2192remote] Deleted ${relativePath}`);
         } else {
           console.error(`[sync] Failed to delete ${relativePath}: HTTP ${res.status}`);
         }
@@ -638,7 +760,7 @@ class SyncEngine {
         const url = `${this.baseUrl}/project/${this.projectId}/file/${fileId}`;
         const res = await httpDelete(url, this.cookie, this.csrfToken);
         if (res.status === 200 || res.status === 204) {
-          console.log(`[local→remote] Deleted ${relativePath} (binary)`);
+          console.log(`[local\u2192remote] Deleted ${relativePath} (binary)`);
         } else {
           console.error(`[sync] Failed to delete binary ${relativePath}: HTTP ${res.status}`);
         }
@@ -682,7 +804,7 @@ class SyncEngine {
       this._atomicWrite(absPath, content);
       release();
 
-      console.log(`[remote→local] New doc ${relativePath} (v${version})`);
+      console.log(`[remote\u2192local] New doc ${relativePath} (v${version})`);
     } catch (err) {
       console.error(`[sync] Failed to sync new doc ${doc.name}: ${err.message}`);
     }
@@ -704,13 +826,14 @@ class SyncEngine {
       const url = `${this.baseUrl}/project/${this.projectId}/file/${file._id}`;
       const res = await httpGetBinary(url, this.cookie);
       if (res.status === 200) {
+        // Set maps before file write so concurrent events see the tracked file
+        this.filePaths.set(file._id, relativePath);
+        this.pathToFileId.set(relativePath, file._id);
         fs.mkdirSync(path.dirname(absPath), { recursive: true });
         const release = this.watcher.suppress(absPath);
         fs.writeFileSync(absPath, res.body);
         release();
-        this.filePaths.set(file._id, relativePath);
-        this.pathToFileId.set(relativePath, file._id);
-        console.log(`[remote→local] Downloaded ${relativePath} (binary)`);
+        console.log(`[remote\u2192local] Downloaded ${relativePath} (binary)`);
       }
     } catch (err) {
       console.error(`[sync] Failed to download ${file.name}: ${err.message}`);
@@ -718,14 +841,30 @@ class SyncEngine {
   }
 
   /**
-   * Resolve folder ID to relative path.
+   * Resolve folder ID to relative path (O(1) via reverse map).
    */
   _folderPathById(folderId) {
     if (folderId === this.rootFolderId) return '';
-    for (const [folderPath, id] of this.pathToFolderId.entries()) {
-      if (id === folderId) return folderPath;
+    return this._folderIdToPath.get(folderId) || '';
+  }
+
+  /**
+   * Refresh auth credentials on 403. Returns true if auth was refreshed (caller should retry).
+   */
+  async _refreshAuthIfNeeded() {
+    if (!this.onAuthExpired) return false;
+    try {
+      const newAuth = await this.onAuthExpired();
+      if (newAuth) {
+        this.cookie = newAuth.cookie;
+        this.csrfToken = newAuth.csrfToken;
+        console.log('[sync] Auth credentials refreshed');
+        return true;
+      }
+    } catch (e) {
+      console.error('[sync] Auth refresh failed:', e.message);
     }
-    return '';
+    return false;
   }
 
   /**
@@ -789,7 +928,7 @@ class SyncEngine {
       sendEpoch: epoch,
     };
 
-    console.log(`[local→remote] ${docState.path} (${ops.length} ops, v${docState.version})`);
+    console.log(`[local\u2192remote] ${docState.path} (${ops.length} ops, v${docState.version})`);
 
     try {
       await this.socket.applyOtUpdate(docId, ops, docState.version, newContent);

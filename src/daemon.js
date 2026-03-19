@@ -25,6 +25,7 @@ class Daemon {
   async listProjects() {
     const { cookie, url } = this.config;
     console.log(`Connecting to ${url}...`);
+    await updateCookies(cookie, url);
     const { projects, userEmail } = await fetchProjectPage(cookie, url);
     if (userEmail) console.log(`Logged in as: ${userEmail}`);
     return projects;
@@ -159,7 +160,13 @@ class Daemon {
     });
 
     // 4. Start sync engine
-    this.syncEngine = new SyncEngine(this.socketManager, this.watcher, dir, url, updatedCookie, projectId, csrfToken);
+    this.syncEngine = new SyncEngine(this.socketManager, this.watcher, dir, url, updatedCookie, projectId, csrfToken, {
+      onAuthExpired: async () => {
+        const { csrfToken: newCsrf } = await fetchProjectPage(cookie, url);
+        const newCookie = await updateCookies(cookie, url);
+        return { cookie: newCookie, csrfToken: newCsrf };
+      },
+    });
 
     // 5. Initial sync
     await this.syncEngine.initialSync(joinResult.project);
@@ -213,6 +220,10 @@ class Daemon {
           this.syncEngine.cleanup();
           this.syncEngine.detach(); // remove watcher listener
         }
+        // Disconnect old socket before creating new one
+        if (this.socketManager) {
+          this.socketManager.disconnect();
+        }
 
         const { csrfToken } = await fetchProjectPage(cookie, url);
         this.socketManager = new SocketManager(updatedCookie, this._projectId, url);
@@ -220,7 +231,13 @@ class Daemon {
         console.log('[daemon] Reconnected successfully');
 
         // Re-initialize sync
-        this.syncEngine = new SyncEngine(this.socketManager, this.watcher, dir, url, updatedCookie, this._projectId, csrfToken);
+        this.syncEngine = new SyncEngine(this.socketManager, this.watcher, dir, url, updatedCookie, this._projectId, csrfToken, {
+          onAuthExpired: async () => {
+            const { csrfToken: newCsrf } = await fetchProjectPage(cookie, url);
+            const newCookie = await updateCookies(cookie, url);
+            return { cookie: newCookie, csrfToken: newCsrf };
+          },
+        });
         await this.syncEngine.initialSync(joinResult.project);
 
         // H3: single disconnect handler via once

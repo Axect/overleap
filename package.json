@@ -1,6 +1,6 @@
 {
   "name": "overleap",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "Bidirectional real-time sync between Overleaf projects and local files",
   "author": "Tae-Geun Kim",
   "license": "MIT",
@@ -28,7 +28,8 @@
     "LICENSE"
   ],
   "scripts": {
-    "start": "node bin/overleap.js"
+    "start": "node bin/overleap.js",
+    "test": "node --test test/*.test.js"
   },
   "dependencies": {
     "cheerio": "^1.0.0",

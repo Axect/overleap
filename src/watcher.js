@@ -1,20 +1,11 @@
 'use strict';
 
+const fs = require('fs');
 const crypto = require('crypto');
 const chokidar = require('chokidar');
 const path = require('path');
 const EventEmitter = require('events');
-
-const IGNORE_PATTERNS = [
-  /(^|[/\\])\../,  // dotfiles
-  /node_modules/,
-  /\.git/,
-  /\.env(\.|$)/,   // .env, .env.local, .env.production
-  /~$/,             // editor backup files
-  /\.swp$/,
-  /\.swo$/,
-  /\.tmp\.\d+$/,    // our own atomic write temp files
-];
+const { IGNORE_PATTERNS } = require('./constants');
 
 class FileWatcher extends EventEmitter {
   constructor(dir, opts = {}) {
@@ -29,6 +20,9 @@ class FileWatcher extends EventEmitter {
 
     // L1: TTL safety net — auto-clear stale suppressions after 5s
     this._suppressionTimers = new Map();
+
+    // Path-based suppression for binary files (no content hash available)
+    this._suppressedPaths = new Set();
 
     // Debounce timers per file
     this._debounceTimers = new Map();
@@ -59,6 +53,12 @@ class FileWatcher extends EventEmitter {
   }
 
   _handleEvent(eventType, filePath) {
+    // Path-based suppression — suppress ALL event types including unlink
+    if (this._suppressedPaths.has(filePath)) {
+      this._clearSuppression(filePath);
+      return;
+    }
+
     // H4: content-hash based suppression
     if (this._expectedHashes.has(filePath)) {
       if (eventType === 'unlink') {
@@ -68,7 +68,6 @@ class FileWatcher extends EventEmitter {
       } else {
         // Read the file and check hash
         try {
-          const fs = require('fs');
           const content = fs.readFileSync(filePath, 'utf-8');
           const hash = this._hashContent(content);
           if (hash === this._expectedHashes.get(filePath)) {
@@ -109,6 +108,8 @@ class FileWatcher extends EventEmitter {
 
     if (content !== undefined) {
       this._expectedHashes.set(absPath, this._hashContent(content));
+    } else {
+      this._suppressedPaths.add(absPath);
     }
 
     // L1: TTL safety — clear after 5s even if chokidar never fires
@@ -124,6 +125,7 @@ class FileWatcher extends EventEmitter {
 
   _clearSuppression(absPath) {
     this._expectedHashes.delete(absPath);
+    this._suppressedPaths.delete(absPath);
     if (this._suppressionTimers.has(absPath)) {
       clearTimeout(this._suppressionTimers.get(absPath));
       this._suppressionTimers.delete(absPath);
@@ -144,6 +146,7 @@ class FileWatcher extends EventEmitter {
     }
     this._suppressionTimers.clear();
     this._expectedHashes.clear();
+    this._suppressedPaths.clear();
   }
 }
 
