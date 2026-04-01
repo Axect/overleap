@@ -92,6 +92,9 @@ class SyncEngine {
     this._replacingFileIds = new Set();
     // Per-doc flush debounce timers (rapid edit protection)
     this._flushTimers = new Map();
+    // Track locally-initiated doc creates (relativePath -> content saved before POST).
+    // Lets _handleRemoteDocCreate distinguish our own echo from a legitimate remote create.
+    this._locallyInitiated = new Map();
     // Limit concurrent binary uploads
     this._binarySemaphore = new Semaphore(3);
 
@@ -485,6 +488,12 @@ class SyncEngine {
   async _createTextDoc(absPath, relativePath, fileName, parentFolderId) {
     const content = fs.readFileSync(absPath, 'utf-8');
 
+    // Mark as locally initiated BEFORE POST so _handleRemoteDocCreate can
+    // distinguish our own echo from a legitimate remote create, even if
+    // joinDoc fails and _creatingFiles is cleaned up.
+    this._locallyInitiated.set(relativePath, content);
+    const initTimer = setTimeout(() => this._locallyInitiated.delete(relativePath), 60000);
+
     const url = `${this.baseUrl}/project/${this.projectId}/doc`;
     const res = await httpPost(url, this.cookie, this.csrfToken, {
       name: fileName,
@@ -497,6 +506,8 @@ class SyncEngine {
 
     if (res.status !== 200 && res.status !== 201) {
       console.error(`[sync] Failed to create ${relativePath}: HTTP ${res.status}`);
+      clearTimeout(initTimer);
+      this._locallyInitiated.delete(relativePath);
       return;
     }
 
@@ -505,6 +516,8 @@ class SyncEngine {
       newDoc = JSON.parse(res.body);
     } catch (e) {
       console.error(`[sync] Failed to parse create-doc response for ${relativePath}: ${e.message}`);
+      clearTimeout(initTimer);
+      this._locallyInitiated.delete(relativePath);
       return;
     }
     const docId = newDoc._id;
@@ -522,6 +535,8 @@ class SyncEngine {
       needsResync: false,
     });
     this.pathToDocId.set(relativePath, docId);
+    clearTimeout(initTimer);
+    this._locallyInitiated.delete(relativePath);
 
     console.log(`[local\u2192remote] Created ${relativePath} (${docId})`);
 
@@ -783,6 +798,7 @@ class SyncEngine {
     const relativePath = prefix ? prefix + '/' + doc.name : doc.name;
 
     if (this.pathToDocId.has(relativePath)) return; // already tracked
+    if (this._creatingFiles.has(relativePath)) return; // being created locally
 
     try {
       const { lines, version } = await this.socket.joinDoc(doc._id);
@@ -800,11 +816,21 @@ class SyncEngine {
 
       const absPath = path.join(this.dir, relativePath);
       fs.mkdirSync(path.dirname(absPath), { recursive: true });
-      const release = this.watcher.suppress(absPath, content);
-      this._atomicWrite(absPath, content);
-      release();
 
-      console.log(`[remote\u2192local] New doc ${relativePath} (v${version})`);
+      // If this doc was locally initiated (our POST succeeded but joinDoc
+      // failed inside _createTextDoc), recover by pushing saved local content
+      // instead of overwriting the local file with the empty server doc.
+      const savedContent = this._locallyInitiated.get(relativePath);
+      if (savedContent !== undefined) {
+        this._locallyInitiated.delete(relativePath);
+        console.log(`[remote\u2192local] New doc ${relativePath} (v${version}) — recovering local create, pushing to remote`);
+        await this._flushDoc(doc._id);
+      } else {
+        const release = this.watcher.suppress(absPath, content);
+        this._atomicWrite(absPath, content);
+        release();
+        console.log(`[remote\u2192local] New doc ${relativePath} (v${version})`);
+      }
     } catch (err) {
       console.error(`[sync] Failed to sync new doc ${doc.name}: ${err.message}`);
     }
@@ -818,6 +844,7 @@ class SyncEngine {
     const relativePath = prefix ? prefix + '/' + file.name : file.name;
 
     if (this.pathToFileId.has(relativePath)) return; // already tracked
+    if (this._creatingFiles.has(relativePath)) return; // being created locally
 
     const absPath = path.join(this.dir, relativePath);
     if (fs.existsSync(absPath)) return;

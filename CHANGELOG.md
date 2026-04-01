@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.5] — 2026-04-01
+
+### Fixed
+
+- **Local-created file overwrite**: locally-created text documents were overwritten with empty content when the server echoed back the `reciveNewDoc` event before `_createTextDoc` finished registering the path — added `_creatingFiles` guard in both `_handleRemoteDocCreate` and `_handleRemoteFileCreate` to skip echoes during active local creation
+- **joinDoc failure recovery**: when `_createTextDoc` POST succeeded but `joinDoc` threw (e.g. `joinLeaveEpoch mismatch`), the `_creatingFiles` guard was already cleaned up, allowing the remote echo to overwrite the local file — added `_locallyInitiated` Map that persists the saved content across the full create lifecycle, enabling `_handleRemoteDocCreate` to recover by pushing local content instead of overwriting
+
 ## [0.2.4] — 2026-03-19
 
 ### Fixed
@@ -108,6 +115,7 @@
 - `.env` file support for configuration
 - Graceful shutdown on SIGINT/SIGTERM
 
+[0.2.5]: https://github.com/Axect/overleap/releases/tag/v0.2.5
 [0.2.4]: https://github.com/Axect/overleap/releases/tag/v0.2.4
 [0.2.3]: https://github.com/Axect/overleap/releases/tag/v0.2.3
 [0.2.2]: https://github.com/Axect/overleap/releases/tag/v0.2.2
