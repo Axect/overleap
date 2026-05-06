@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.6] — 2026-05-06
+
+### Fixed
+
+- **Interactive project picker**: `overleap sync` (no `-p`) and `-p <query>` with multiple matches errored with `Input stream closed` immediately after entering a valid number. `rl.close()` emits `'close'` synchronously, so the close handler rejected the promise before the question callback could `resolve()`. Added an `answered` flag so the close handler only fires for genuinely premature stdin closure.
+
 ## [0.2.5] — 2026-04-01
 
 ### Fixed

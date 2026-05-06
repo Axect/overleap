@@ -100,14 +100,18 @@ class Daemon {
     console.log();
   }
 
-  // L7: handle stdin close gracefully
+  // L7: handle stdin close gracefully.
+  // rl.close() emits 'close' synchronously, so the close handler must ignore
+  // it once the user has answered — otherwise it rejects before resolve runs.
   _promptNumber(max) {
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
     return new Promise((resolve, reject) => {
+      let answered = false;
       rl.on('close', () => {
-        reject(new Error('Input stream closed'));
+        if (!answered) reject(new Error('Input stream closed'));
       });
       rl.question(`Pick a project (1-${max}): `, (answer) => {
+        answered = true;
         rl.close();
         const n = parseInt(answer.trim(), 10);
         if (isNaN(n) || n < 1 || n > max) {
