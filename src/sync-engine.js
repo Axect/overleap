@@ -5,7 +5,7 @@ const path = require('path');
 const { computeOps } = require('./diff');
 const { flattenTree } = require('./tree');
 const { IGNORE_PATTERNS } = require('./constants');
-const { httpPost, httpDelete, httpPostMultipart, httpGetBinary } = require('./auth');
+const { httpPost, httpDelete, httpPostMultipart, httpGetBinaryRetry } = require('./auth');
 
 const TEXT_EXTENSIONS = new Set([
   '.tex', '.bib', '.cls', '.sty', '.bst', '.def', '.cfg', '.dtx', '.ins',
@@ -239,7 +239,7 @@ class SyncEngine {
 
         try {
           const url = `${this.baseUrl}/project/${this.projectId}/file/${fileId}`;
-          const res = await httpGetBinary(url, this.cookie);
+          const res = await httpGetBinaryRetry(url, this.cookie, { label: relPath });
           if (res.status === 200) {
             fs.mkdirSync(path.dirname(absPath), { recursive: true });
             const release = this.watcher.suppress(absPath);
@@ -851,7 +851,7 @@ class SyncEngine {
 
     try {
       const url = `${this.baseUrl}/project/${this.projectId}/file/${file._id}`;
-      const res = await httpGetBinary(url, this.cookie);
+      const res = await httpGetBinaryRetry(url, this.cookie, { label: relativePath });
       if (res.status === 200) {
         // Set maps before file write so concurrent events see the tracked file
         this.filePaths.set(file._id, relativePath);

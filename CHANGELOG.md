@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.7] — 2026-07-08
+
+### Fixed
+
+- **Binary download retries**: initial-sync figure downloads and remote-created binary downloads had no retry, so a single transient TLS/socket drop from Overleaf left the file permanently missing (Cloudflare occasionally resets connections mid-handshake during a burst of sequential downloads, surfacing as `Client network socket disconnected before secure TLS connection was established`). Added `httpGetBinaryRetry` in `auth.js` with exponential backoff (3 attempts, 500ms/1s/2s) that retries transient network errors (`ECONNRESET`, `ETIMEDOUT`, `EPIPE`, socket disconnect/hang-up, timeouts) and transient HTTP statuses (429, 5xx); non-retryable statuses like 403/404 return on the first attempt. Wired into both binary download paths in `sync-engine.js`.
+
 ## [0.2.6] — 2026-05-06
 
 ### Fixed
