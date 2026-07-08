@@ -289,4 +289,52 @@ function httpGetBinary(url, cookie) {
   });
 }
 
-module.exports = { fetchProjectPage, updateCookies, httpGet, httpPost, httpDelete, httpPostMultipart, httpGetBinary };
+function _sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Transient network failures worth retrying: mid-handshake resets, dropped
+// sockets, DNS hiccups, timeouts. Overleaf sits behind Cloudflare, which
+// occasionally resets connections during a burst of sequential downloads.
+function _isRetryableNetworkError(err) {
+  if (!err) return false;
+  const code = err.code || '';
+  if (['ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED', 'EPIPE', 'EAI_AGAIN', 'ENOTFOUND'].includes(code)) {
+    return true;
+  }
+  const msg = err.message || '';
+  return /socket disconnected|socket hang up|network socket|Download timeout/i.test(msg);
+}
+
+// Wrap httpGetBinary with exponential-backoff retry on transient network
+// errors and transient server statuses (429, 5xx). Non-retryable statuses
+// (e.g. 403/404) are returned as-is on the first attempt.
+async function httpGetBinaryRetry(url, cookie, opts = {}) {
+  const maxRetries = opts.maxRetries != null ? opts.maxRetries : 3;
+  const baseDelay = opts.baseDelay != null ? opts.baseDelay : 500;
+  const label = opts.label || url;
+
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const res = await httpGetBinary(url, cookie);
+      const transientStatus = res.status === 429 || (res.status >= 500 && res.status < 600);
+      if (transientStatus && attempt < maxRetries) {
+        const delay = baseDelay * Math.pow(2, attempt);
+        console.warn(`[sync] ${label}: HTTP ${res.status}, retry ${attempt + 1}/${maxRetries} in ${delay}ms`);
+        await _sleep(delay);
+        continue;
+      }
+      return res;
+    } catch (err) {
+      if (attempt < maxRetries && _isRetryableNetworkError(err)) {
+        const delay = baseDelay * Math.pow(2, attempt);
+        console.warn(`[sync] ${label}: ${err.message}, retry ${attempt + 1}/${maxRetries} in ${delay}ms`);
+        await _sleep(delay);
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
+module.exports = { fetchProjectPage, updateCookies, httpGet, httpPost, httpDelete, httpPostMultipart, httpGetBinary, httpGetBinaryRetry };
