@@ -317,18 +317,31 @@ class Daemon {
       return;
     }
 
-    // Download PDF
+    // Download PDF. Build output is served by the specific CLSI backend that ran the
+    // compile, so the request must name that backend via clsiserverid; without it
+    // Overleaf routes to an arbitrary backend that has never heard of this build and
+    // answers 404. Refreshing the load-balancer cookies does not help on its own.
     const pdfFile = result.outputFiles.find((f) => f.type === 'pdf');
-    if (pdfFile) {
-      const pdfUrl = `${url}${pdfFile.url}`;
-      console.log('[compile] Downloading PDF...');
-      const pdfRes = await httpGetBinary(pdfUrl, cookie);
-      if (pdfRes.status === 200) {
-        const outPath = path.join(this.config.dir, 'output.pdf');
-        fs.writeFileSync(outPath, pdfRes.body);
-        console.log(`[compile] PDF saved to: ${outPath}`);
-      }
+    if (!pdfFile) {
+      console.error('[compile] Compilation succeeded but produced no PDF.');
+      return;
     }
+
+    const sep = pdfFile.url.includes('?') ? '&' : '?';
+    const pdfUrl = result.clsiServerId
+      ? `${url}${pdfFile.url}${sep}clsiserverid=${encodeURIComponent(result.clsiServerId)}`
+      : `${url}${pdfFile.url}`;
+
+    console.log('[compile] Downloading PDF...');
+    const pdfRes = await httpGetBinary(pdfUrl, cookie);
+    if (pdfRes.status !== 200) {
+      console.error(`[compile] PDF download failed: HTTP ${pdfRes.status}`);
+      return;
+    }
+
+    const outPath = path.join(this.config.dir, 'output.pdf');
+    fs.writeFileSync(outPath, pdfRes.body);
+    console.log(`[compile] PDF saved to: ${outPath}`);
   }
 }
 
