@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.8] — 2026-08-02
+
+### Fixed
+
+- **`compile` silently produced no PDF**: build output is served by the specific CLSI backend that ran the compile, and the download request omitted the `clsiserverid` query parameter, so Overleaf routed it to a backend with no record of that build and answered 404. Refreshing the load-balancer cookies via `updateCookies` does not help; only the backend id does. Since the response was checked for `status === 200` with no `else` branch, `overleap compile` printed `Downloading PDF...`, exited 0, and wrote nothing. Now passes `clsiServerId` from the compile response (omitted when the server does not send one, so self-hosted instances are unaffected), and reports a non-200 download or a missing PDF output file instead of returning quietly.
+
 ## [0.2.7] — 2026-07-08
 
 ### Fixed
