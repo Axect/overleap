@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.3.0] — 2026-10-20
+
+### Added
+
+- **Directory binding**: the first `sync` in a directory writes `.overleap-project` (`{"id", "name"}`); later `sync` and `compile` in that directory exit with an error naming the bound project when `-p` resolves to any other project. Project numbers follow the last-modified order of the project list, so `-p 5` silently named a different project after the previous sync touched one; a reused directory now fails instead of syncing into the wrong project.
+- **Project IDs in output**: `overleap projects` prints each project's 24-hex ID, and the `Selected:`/`Matched:` lines include it. Numeric selection also prints a note that numbers shift and suggests the ID.
+
+### Fixed
+
+- **Logs and LaTeX build artifacts uploaded to the project**: `.log`, `.aux`, `.out`, `.fls`, `.fdb_latexmk`, `.synctex(.gz)`, `.xdv`, `.blg`, `.bcf`, `.run.xml`, `.toc`, `.lof`, `.lot`, `.nav`, `.snm`, `.vrb` are now in `IGNORE_PATTERNS`. Redirecting the daemon's own output into the sync directory (`overleap sync > sync.log`) uploaded the log as a new document and streamed every line to collaborators; local `pdflatex` runs leaked the same way. `.bbl` stays synced.
+
 ## [0.2.8] — 2026-08-02
 
 ### Fixed
