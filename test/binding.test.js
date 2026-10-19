@@ -1,0 +1,61 @@
+'use strict';
+
+const { describe, it, beforeEach, afterEach } = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const { readBinding, assertBinding, writeBinding, BINDING_FILE } = require('../src/binding');
+const { IGNORE_PATTERNS } = require('../src/constants');
+
+const ID_A = 'aaaaaaaaaaaaaaaaaaaaaaaa';
+const ID_B = 'bbbbbbbbbbbbbbbbbbbbbbbb';
+
+describe('directory binding', () => {
+  let dir;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'overleap-binding-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('allows any project in an unbound directory', () => {
+    assert.equal(assertBinding(dir, ID_A), null);
+  });
+
+  it('accepts the bound project and rejects a different one', () => {
+    writeBinding(dir, ID_A, 'Referee report');
+    assert.deepEqual(assertBinding(dir, ID_A), { id: ID_A, name: 'Referee report' });
+    assert.throws(() => assertBinding(dir, ID_B), /bound to project "Referee report"/);
+  });
+
+  it('rejects a malformed binding file instead of ignoring it', () => {
+    fs.writeFileSync(path.join(dir, BINDING_FILE), '{"name": "no id"}');
+    assert.throws(() => readBinding(dir), /malformed/);
+  });
+
+  it('is never uploaded (dotfile is ignored)', () => {
+    assert.ok(IGNORE_PATTERNS.some((p) => p.test(BINDING_FILE)));
+  });
+});
+
+describe('IGNORE_PATTERNS for logs and LaTeX artifacts', () => {
+  const ignored = (rel) => IGNORE_PATTERNS.some((p) => p.test(rel));
+
+  it('skips logs and build artifacts at any depth', () => {
+    for (const rel of ['sync.log', 'main.aux', 'main.synctex.gz', 'main.fdb_latexmk',
+      'main.out', 'main.xdv', 'sections/ch1.aux']) {
+      assert.ok(ignored(rel), `${rel} should be ignored`);
+    }
+  });
+
+  it('keeps project sources, including .bbl for arXiv-style uploads', () => {
+    for (const rel of ['main.tex', 'refs.bib', 'main.bbl', 'figs/plot.pdf', 'style.sty',
+      'catalog.txt', 'outline.tex']) {
+      assert.ok(!ignored(rel), `${rel} should be synced`);
+    }
+  });
+});

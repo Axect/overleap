@@ -104,6 +104,12 @@ overleap sync
 -p 64a1b2c3d4e5...      # direct Overleaf project ID
 ```
 
+Project numbers follow the last-modified order of the list, so they shift as soon as any project is edited (including by your own sync). Use the ID shown by `overleap projects` in scripts, or put `OVERLEAF_PROJECT_ID` in the directory's `.env`.
+
+**Directory binding.** The first `sync` in a directory records the project in `.overleap-project`. Later `sync` or `compile` runs in that directory refuse any other project and print the bound ID. Delete the file to re-point the directory.
+
+**Never uploaded:** dotfiles (including `.env` and `.overleap-project`), `node_modules`, editor backups, and logs or LaTeX build artifacts (`.log`, `.aux`, `.out`, `.fls`, `.fdb_latexmk`, `.synctex.gz`, `.xdv`, `.blg`, `.bcf`, `.run.xml`, `.toc`, `.lof`, `.lot`, `.nav`, `.snm`, `.vrb`). `.bbl` is synced.
+
 ## Getting Your Cookie
 
 1. Open [overleaf.com](https://www.overleaf.com) and log in

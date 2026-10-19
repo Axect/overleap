@@ -30,10 +30,13 @@ Options:
   --help, -h              Show this help
 
 Project selection:
-  -p 3                    Pick 3rd project from the list
+  -p 3                    Pick 3rd project from the list (order shifts after edits)
   -p "quantum"            Fuzzy match by name
-  -p 64a1b2c3d4e5...      Direct Overleaf project ID
+  -p 64a1b2c3d4e5...      Direct Overleaf project ID (stable; use in scripts)
   (omit -p)               Interactive numbered list
+
+A directory is bound to the project of its first sync (.overleap-project);
+sync/compile there refuse any other project.
 
 Environment variables (or .env file):
   OVERLEAF_COOKIE         Session cookie

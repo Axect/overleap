@@ -8,6 +8,7 @@ const { fetchProjectPage, updateCookies, httpPost, httpGetBinary } = require('./
 const SocketManager = require('./socket');
 const FileWatcher = require('./watcher');
 const SyncEngine = require('./sync-engine');
+const { assertBinding, writeBinding, BINDING_FILE } = require('./binding');
 
 class Daemon {
   constructor(opts) {
@@ -56,7 +57,9 @@ class Daemon {
         throw new Error(`Invalid number: ${idx}. Choose 1-${projects.length}.`);
       }
       const picked = projects[idx - 1];
-      console.log(`Selected: ${picked.name}\n`);
+      console.log(`Selected: ${picked.name} (${picked.id})`);
+      console.log('Note: project numbers follow last-modified order and shift after edits; ' +
+        `prefer -p ${picked.id} in scripts.\n`);
       return picked.id;
     }
 
@@ -68,7 +71,7 @@ class Daemon {
       );
 
       if (matches.length === 1) {
-        console.log(`Matched: ${matches[0].name}\n`);
+        console.log(`Matched: ${matches[0].name} (${matches[0].id})\n`);
         return matches[0].id;
       }
 
@@ -95,7 +98,7 @@ class Daemon {
       const num = String(i + 1).padStart(3);
       const name = p.name.padEnd(maxNameLen);
       const date = p.lastUpdated ? new Date(p.lastUpdated).toLocaleDateString() : '';
-      console.log(`  ${num}. ${name}  [${p.accessLevel}]  ${date}`);
+      console.log(`  ${num}. ${name}  ${p.id}  [${p.accessLevel}]  ${date}`);
     });
     console.log();
   }
@@ -129,6 +132,7 @@ class Daemon {
   async start() {
     const { cookie, url, dir } = this.config;
     const projectId = await this.resolveProjectId(this.config.projectId);
+    const bound = assertBinding(dir, projectId);
     // Store resolved projectId for reconnection
     this._projectId = projectId;
 
@@ -147,6 +151,10 @@ class Daemon {
     const projectName = joinResult.project?.name || projectId;
     console.log(`[daemon] Connected to project: ${projectName}`);
     console.log(`[daemon] Permissions: ${joinResult.permissionsLevel}`);
+    if (!bound) {
+      writeBinding(dir, projectId, projectName);
+      console.log(`[daemon] Bound ${dir} to this project (${BINDING_FILE})`);
+    }
 
     // 3. Start file watcher
     this.watcher = new FileWatcher(dir);
@@ -290,6 +298,7 @@ class Daemon {
   async compile() {
     const { cookie, url } = this.config;
     const projectId = await this.resolveProjectId(this.config.projectId);
+    assertBinding(this.config.dir, projectId);
 
     console.log(`[compile] Triggering compilation for ${projectId}...`);
 
