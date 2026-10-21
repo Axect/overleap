@@ -118,3 +118,24 @@ describe('FileWatcher suppression', () => {
     assert.ok(watcher._expectedHashes.has(filePath));
   });
 });
+
+describe('FileWatcher ignore patterns', () => {
+  it('watches a sync dir inside a dot-directory but still skips dotfiles in it', async () => {
+    const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'overleap-test-'));
+    const dir = path.join(parent, '.cache', 'proj');
+    fs.mkdirSync(dir, { recursive: true });
+    const watcher = new FileWatcher(dir, { debounceMs: 10 });
+    await watcher.start();
+    const events = [];
+    watcher.on('file-change', (e) => events.push(e.relativePath));
+    try {
+      fs.writeFileSync(path.join(dir, 'main.tex'), 'x');
+      fs.writeFileSync(path.join(dir, '.overleap-lock'), 'x');
+      await new Promise((r) => setTimeout(r, 1500));
+      assert.deepEqual(events, ['main.tex']);
+    } finally {
+      await watcher.stop();
+      fs.rmSync(parent, { recursive: true, force: true });
+    }
+  });
+});

@@ -30,7 +30,12 @@ class FileWatcher extends EventEmitter {
 
   start() {
     this.watcher = chokidar.watch(this.dir, {
-      ignored: IGNORE_PATTERNS,
+      // Match against the path inside the sync dir: chokidar passes absolute paths, so the
+      // dotfile pattern matched every file of a dir under e.g. ~/.cache and nothing synced.
+      ignored: (absPath) => {
+        const rel = path.relative(this.dir, absPath);
+        return rel !== '' && IGNORE_PATTERNS.some((p) => p.test(rel));
+      },
       persistent: true,
       ignoreInitial: true,
       awaitWriteFinish: {
