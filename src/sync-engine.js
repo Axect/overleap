@@ -2,10 +2,16 @@
 
 const fs = require('fs');
 const path = require('path');
-const { computeOps } = require('./diff');
+const { computeOps, merge3 } = require('./diff');
 const { flattenTree } = require('./tree');
 const { IGNORE_PATTERNS } = require('./constants');
 const { httpPost, httpDelete, httpPostMultipart, httpGetBinaryRetry } = require('./auth');
+
+// How long the old id of a file we replaced stays known after our upload finishes.
+const REPLACED_ID_TTL_MS = 30000;
+// How long a binary removed on server is kept locally while waiting for the
+// reciveNewFile that follows removeEntity when another editor replaces it.
+const REMOTE_REMOVAL_GRACE_MS = 1500;
 
 const TEXT_EXTENSIONS = new Set([
   '.tex', '.bib', '.cls', '.sty', '.bst', '.def', '.cfg', '.dtx', '.ins',
@@ -87,9 +93,13 @@ class SyncEngine {
     this._creatingFiles = new Set();
     // Prevent concurrent folder creation for the same path
     this._creatingFolders = new Map();
-    // Track file entity IDs being replaced by _handleBinaryUpdate
-    // so removeEntity can skip deleting the local file during replacement
+    // File entity IDs we replaced by uploading a new version (_handleBinaryUpdate). Kept
+    // for REPLACED_ID_TTL_MS after the upload: Overleaf publishes removeEntity(oldId)
+    // before answering the upload, but the event can still reach us after the response.
     this._replacingFileIds = new Set();
+    // relativePath -> timer: binaries removed on server whose local deletion is deferred,
+    // because a replace by another editor arrives as removeEntity(old) + reciveNewFile(new).
+    this._pendingRemovals = new Map();
     // Per-doc flush debounce timers (rapid edit protection)
     this._flushTimers = new Map();
     // Track locally-initiated doc creates (relativePath -> content saved before POST).
@@ -135,9 +145,7 @@ class SyncEngine {
       const docState = this.docs.get(entityId);
       if (docState) {
         console.log(`[sync] Doc removed on server: ${docState.path}`);
-        const absPath = path.join(this.dir, docState.path);
-        const release = this.watcher.suppress(absPath);
-        fs.promises.unlink(absPath).catch(() => {}).finally(release);
+        this._unlinkLocal(docState.path);
         this.docs.delete(entityId);
         this.pathToDocId.delete(docState.path);
         return;
@@ -145,18 +153,19 @@ class SyncEngine {
 
       const filePath = this.filePaths.get(entityId);
       if (filePath) {
-        // If this entity is being replaced by _handleBinaryUpdate, skip
-        // the local file deletion — the file has been updated, not removed.
-        if (this._replacingFileIds.has(entityId)) {
-          this.filePaths.delete(entityId);
+        this.filePaths.delete(entityId);
+        // An entity we replaced, or one the path no longer maps to: the file at this path
+        // is newer than the removed entity, so it stays.
+        if (this._replacingFileIds.has(entityId) || this.pathToFileId.get(filePath) !== entityId) {
           return;
         }
-        console.log(`[sync] Binary file removed on server: ${filePath}`);
-        const absPath = path.join(this.dir, filePath);
-        const release = this.watcher.suppress(absPath);
-        fs.promises.unlink(absPath).catch(() => {}).finally(release);
-        this.filePaths.delete(entityId);
         this.pathToFileId.delete(filePath);
+        this._cancelPendingRemoval(filePath);
+        this._pendingRemovals.set(filePath, setTimeout(() => {
+          this._pendingRemovals.delete(filePath);
+          console.log(`[sync] Binary file removed on server: ${filePath}`);
+          this._unlinkLocal(filePath);
+        }, REMOTE_REMOVAL_GRACE_MS));
       }
     });
 
@@ -323,38 +332,29 @@ class SyncEngine {
     const docState = this.docs.get(update.doc);
     if (!docState) return;
 
-    // Ack for our own update (no op field, or empty op)
-    if (!update.op || update.op.length === 0) {
-      // Validate: ack must correspond to a pending send
-      if (!docState.pending) {
-        // Stray/duplicate ack with no pending send — ignore
-        return;
-      }
-      // Our update was applied — advance version past it
-      docState.version++;
-      const committedContent = docState.pending.targetContent;
-      docState.pending = null;
-
-      if (docState.needsResync) {
-        docState.needsResync = false;
-        docState.dirty = false;
-        this._resyncDoc(update.doc).catch((e) => console.error('[sync] Re-sync error:', e.message));
-        return;
-      }
-
-      // Commit the pending content as server-confirmed
-      docState.content = committedContent;
-
-      if (docState.dirty) {
-        docState.dirty = false;
-        this._scheduleFlush(update.doc);
-      }
+    // real-time answers the sender of an update with { doc, v } and sends the full op only
+    // to the other clients (DocumentUpdaterController._applyUpdateFromDocumentUpdater).
+    // An op stamped with our own publicId as meta.source is therefore ours as well.
+    const source = update.meta && update.meta.source;
+    const isOwn = !update.op || update.op.length === 0 ||
+      (source != null && source === this.socket.publicId);
+    if (isOwn) {
+      this._onAck(update, docState);
       return;
     }
 
-    // Remote change from another user
+    // Already included in our content (duplicate delivery); the Overleaf client drops these too.
+    if (typeof update.v === 'number' && update.v < docState.version) return;
+
+    // A re-sync is replacing our content; apply the op on top of the fresh snapshot.
+    if (docState.resyncing) {
+      docState.queued.push(update);
+      return;
+    }
+
+    // Remote change from another editor while our op is in flight. The server transforms
+    // our op over theirs; we re-sync once our ack arrives instead of transforming locally.
     if (docState.pending) {
-      docState.version = update.v + 1;
       docState.needsResync = true;
       console.log(`[sync] Conflict detected on ${docState.path} — will re-sync after ack`);
       return;
@@ -377,16 +377,47 @@ class SyncEngine {
       }
     }
 
+    const previous = docState.content;
     docState.content = content;
     docState.version = update.v + 1;
 
-    // Write to local file (H4: suppress with content hash)
-    const absPath = path.join(this.dir, docState.path);
-    const release = this.watcher.suppress(absPath, content);
-    this._atomicWrite(absPath, content);
-    release();
+    // Local edits not yet flushed are kept on top of the remote change and pushed after it.
+    if (this._writeMerged(docState, previous)) this._scheduleFlush(update.doc);
 
     console.log(`[remote\u2192local] ${docState.path} (v${update.v})`);
+  }
+
+  /**
+   * Our update was applied: update.v is the version it was applied at.
+   */
+  _onAck(update, docState) {
+    const pending = docState.pending;
+    // Stray/duplicate ack with no pending send — ignore
+    if (!pending) return;
+    // A repeated ack of an op acknowledged earlier, not of the one now in flight.
+    if (typeof update.v === 'number' && update.v < pending.baseVersion) return;
+
+    docState.pending = null;
+    docState.version = (typeof update.v === 'number' ? update.v : pending.baseVersion) + 1;
+
+    // Applied above the version we sent it at: the server transformed it over ops we have
+    // not applied, so neither our content nor pending.targetContent is the server's text.
+    const transformed = typeof update.v === 'number' && update.v > pending.baseVersion;
+    if (docState.needsResync || transformed) {
+      docState.needsResync = false;
+      // The server already holds pending.targetContent's edits; only edits made to the
+      // file after that send still need pushing.
+      this._resyncDoc(update.doc, pending.targetContent).catch((e) => console.error('[sync] Re-sync error:', e.message));
+      return;
+    }
+
+    // Commit the pending content as server-confirmed
+    docState.content = pending.targetContent;
+
+    if (docState.dirty) {
+      docState.dirty = false;
+      this._scheduleFlush(update.doc);
+    }
   }
 
   /**
@@ -394,6 +425,10 @@ class SyncEngine {
    */
   _onLocalChange(event) {
     const { type, relativePath } = event;
+
+    // The file was written (or removed) locally after the server removed it: the local
+    // state is newer, so do not apply the server's removal on top of it.
+    this._cancelPendingRemoval(relativePath);
 
     if (type === 'unlink') {
       this._handleLocalDelete(relativePath).catch((e) =>
@@ -408,7 +443,7 @@ class SyncEngine {
       const docState = this.docs.get(docId);
       if (!docState) return;
 
-      if (docState.pending) {
+      if (docState.pending || docState.resyncing) {
         docState.dirty = true;
         return;
       }
@@ -675,7 +710,7 @@ class SyncEngine {
         this._binarySemaphore.release();
       }
     } finally {
-      this._replacingFileIds.delete(oldFileId);
+      setTimeout(() => this._replacingFileIds.delete(oldFileId), REPLACED_ID_TTL_MS).unref();
       this._creatingFiles.delete(relativePath);
     }
   }
@@ -843,11 +878,20 @@ class SyncEngine {
     const prefix = this._folderPathById(parentFolderId);
     const relativePath = prefix ? prefix + '/' + file.name : file.name;
 
+    // removeEntity for this path just came in: another editor replaced the file.
+    const replaced = this._cancelPendingRemoval(relativePath);
+
+    if (this.pathToFileId.get(relativePath) === file._id) return; // already tracked
+    if (this._creatingFiles.has(relativePath)) {
+      // Our own upload of this path, announced before its HTTP response: adopt the id.
+      this.filePaths.set(file._id, relativePath);
+      this.pathToFileId.set(relativePath, file._id);
+      return;
+    }
     if (this.pathToFileId.has(relativePath)) return; // already tracked
-    if (this._creatingFiles.has(relativePath)) return; // being created locally
 
     const absPath = path.join(this.dir, relativePath);
-    if (fs.existsSync(absPath)) return;
+    if (!replaced && fs.existsSync(absPath)) return;
 
     try {
       const url = `${this.baseUrl}/project/${this.projectId}/file/${file._id}`;
@@ -857,14 +901,41 @@ class SyncEngine {
         this.filePaths.set(file._id, relativePath);
         this.pathToFileId.set(relativePath, file._id);
         fs.mkdirSync(path.dirname(absPath), { recursive: true });
-        const release = this.watcher.suppress(absPath);
+        // Held until the watcher reports this write (or the suppression TTL lapses):
+        // releasing it right away let the write come back as a local change and be
+        // uploaded again, replacing the file on the server once more.
+        this.watcher.suppress(absPath);
         fs.writeFileSync(absPath, res.body);
-        release();
-        console.log(`[remote\u2192local] Downloaded ${relativePath} (binary)`);
+        console.log(`[remote\u2192local] ${replaced ? 'Replaced' : 'Downloaded'} ${relativePath} (binary)`);
+      } else if (replaced) {
+        console.error(`[sync] Failed to download replaced ${relativePath}: HTTP ${res.status}; keeping the local copy`);
       }
     } catch (err) {
       console.error(`[sync] Failed to download ${file.name}: ${err.message}`);
     }
+  }
+
+  /**
+   * Cancel a deferred local deletion for `relativePath`. Returns true if one was pending.
+   */
+  _cancelPendingRemoval(relativePath) {
+    const timer = this._pendingRemovals.get(relativePath);
+    if (!timer) return false;
+    clearTimeout(timer);
+    this._pendingRemovals.delete(relativePath);
+    return true;
+  }
+
+  /**
+   * Delete a local file because the server removed it. The watcher suppression is held
+   * until the watcher reports the unlink (or its TTL lapses); releasing it as soon as
+   * unlink() resolved let the delayed event through as a local delete, which deleted
+   * whatever entity the path mapped to by then on the server.
+   */
+  _unlinkLocal(relativePath) {
+    const absPath = path.join(this.dir, relativePath);
+    const release = this.watcher.suppress(absPath);
+    fs.promises.unlink(absPath).catch(() => release());
   }
 
   /**
@@ -900,7 +971,18 @@ class SyncEngine {
    */
   async _flushDoc(docId) {
     const docState = this.docs.get(docId);
-    if (!docState || docState.pending) return;
+    if (!docState) return;
+    // Never diff against content that is about to be replaced: an op in flight or a
+    // re-sync in progress. The change is flushed once the ack or re-sync lands.
+    if (docState.pending || docState.resyncing) {
+      docState.dirty = true;
+      return;
+    }
+    // A failed re-sync left docState.content unconfirmed; fetch the server text first.
+    if (docState.needsResync) {
+      this._resyncDoc(docId).catch((e) => console.error('[sync] Re-sync error:', e.message));
+      return;
+    }
 
     const absPath = path.join(this.dir, docState.path);
 
@@ -927,6 +1009,12 @@ class SyncEngine {
       }
     } catch (err) {
       // File may have been deleted
+      return;
+    }
+
+    // Our own send or a re-sync may have started during the await
+    if (docState.pending || docState.resyncing) {
+      docState.dirty = true;
       return;
     }
 
@@ -994,33 +1082,77 @@ class SyncEngine {
   }
 
   /**
-   * Re-sync a document from the server after a conflict or version gap.
+   * Re-sync a document from the server after a conflict, version gap or failed send.
+   *
+   * `base` is the text the local file's edits are relative to: what we last sent when the
+   * server acknowledged it (so it already holds those edits), otherwise the last
+   * server-confirmed content. Edits made on top of `base` are merged into the server text
+   * and pushed; when the file already matches the server nothing is sent.
    */
-  async _resyncDoc(docId) {
+  async _resyncDoc(docId, base) {
     const docState = this.docs.get(docId);
-    if (!docState) return;
+    if (!docState || docState.resyncing) return;
+    if (base === undefined) base = docState.content;
 
+    docState.resyncing = true;
+    docState.queued = [];
+    this._cancelFlush(docId);
     console.log(`[sync] Re-syncing ${docState.path} from server...`);
 
+    let ok = false;
     try {
       this.socket.leaveDoc(docId);
       const { lines, version } = await this.socket.joinDoc(docId);
-      const serverContent = lines.join('\n');
 
       docState.version = version;
-      docState.content = serverContent;
+      docState.content = lines.join('\n');
       docState.pending = null;
       docState.needsResync = false;
-
-      const absPath = path.join(this.dir, docState.path);
-      const release = this.watcher.suppress(absPath, serverContent);
-      this._atomicWrite(absPath, serverContent);
-      release();
+      docState.dirty = false;
+      this._writeMerged(docState, base);
+      ok = true;
 
       console.log(`[sync] Re-synced ${docState.path} (v${version})`);
     } catch (err) {
+      docState.needsResync = true;
       console.error(`[sync] Re-sync failed for ${docState.path}: ${err.message}`);
+    } finally {
+      docState.resyncing = false;
+      const queued = docState.queued;
+      docState.queued = [];
+      if (ok) {
+        for (const update of queued) this._onRemoteUpdate(update);
+        // Push edits the server does not have yet; a no-op when the file matches it.
+        this._scheduleFlush(docId);
+      }
     }
+  }
+
+  /**
+   * Bring the local file to docState.content (the server text) while keeping the edits
+   * made in it on top of `base` that the server does not have yet. Returns true when the
+   * file still differs from the server text, i.e. there is something left to push.
+   */
+  _writeMerged(docState, base) {
+    const absPath = path.join(this.dir, docState.path);
+    let local;
+    try {
+      local = fs.readFileSync(absPath, 'utf-8');
+    } catch (err) {
+      local = base; // missing file: take the server text
+    }
+
+    const { text, conflicts } = merge3(base, local, docState.content);
+    if (conflicts > 0) {
+      console.warn(`[sync] ${docState.path}: ${conflicts} region(s) changed both locally and on the server; kept the local text`);
+    }
+    if (text !== local) {
+      // H4: suppress with content hash
+      const release = this.watcher.suppress(absPath, text);
+      this._atomicWrite(absPath, text);
+      release();
+    }
+    return text !== docState.content;
   }
 
   /**
@@ -1051,6 +1183,13 @@ class SyncEngine {
       clearTimeout(timer);
     }
     this._flushTimers.clear();
+    // No replacement arrived for these server-side removals: apply them now.
+    for (const [relativePath, timer] of this._pendingRemovals) {
+      clearTimeout(timer);
+      console.log(`[sync] Binary file removed on server: ${relativePath}`);
+      this._unlinkLocal(relativePath);
+    }
+    this._pendingRemovals.clear();
   }
 }
 
