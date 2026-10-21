@@ -66,4 +66,87 @@ function adjustPositions(ops) {
   return adjusted;
 }
 
-module.exports = { computeOps };
+/**
+ * The edits that turn `base` into `other`, as hunks { start, end, text }: replace
+ * base[start, end) with `text`. Hunks are sorted and separated by unchanged text.
+ */
+function hunks(base, other) {
+  const out = [];
+  let pos = 0;
+  let cur = null;
+  for (const [type, text] of fastDiff(base, other)) {
+    if (type === fastDiff.EQUAL) {
+      if (cur) out.push(cur);
+      cur = null;
+      pos += text.length;
+      continue;
+    }
+    if (!cur) cur = { start: pos, end: pos, text: '' };
+    if (type === fastDiff.DELETE) {
+      pos += text.length;
+      cur.end = pos;
+    } else {
+      cur.text += text;
+    }
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
+/**
+ * Three-way merge: carry the edits that turned `base` into `local` over onto `remote`
+ * (which is `base` plus other editors' changes). Edits that touch or overlap form one
+ * region; a region edited on one side takes that side, a region edited identically on
+ * both sides is kept once, and a region edited differently on both sides is a conflict
+ * resolved in favour of `local`. Returns { text, conflicts }.
+ */
+function merge3(base, local, remote) {
+  if (local === base || local === remote) return { text: remote, conflicts: 0 };
+  if (remote === base) return { text: local, conflicts: 0 };
+
+  const all = [
+    ...hunks(base, local).map((h) => ({ ...h, local: true })),
+    ...hunks(base, remote).map((h) => ({ ...h, local: false })),
+  ].sort((a, b) => a.start - b.start || a.end - b.end);
+
+  const regions = [];
+  for (const h of all) {
+    const last = regions[regions.length - 1];
+    if (last && h.start <= last.end) {
+      last.end = Math.max(last.end, h.end);
+      last.hunks.push(h);
+    } else {
+      regions.push({ start: h.start, end: h.end, hunks: [h] });
+    }
+  }
+
+  const applyRegion = (region, hs) => {
+    let out = '';
+    let pos = region.start;
+    for (const h of hs) {
+      out += base.slice(pos, h.start) + h.text;
+      pos = h.end;
+    }
+    return out + base.slice(pos, region.end);
+  };
+
+  let text = '';
+  let pos = 0;
+  let conflicts = 0;
+  for (const region of regions) {
+    const localHunks = region.hunks.filter((h) => h.local);
+    const remoteHunks = region.hunks.filter((h) => !h.local);
+    const localText = applyRegion(region, localHunks);
+    let chosen = localText;
+    if (localHunks.length === 0) {
+      chosen = applyRegion(region, remoteHunks);
+    } else if (remoteHunks.length > 0 && applyRegion(region, remoteHunks) !== localText) {
+      conflicts++;
+    }
+    text += base.slice(pos, region.start) + chosen;
+    pos = region.end;
+  }
+  return { text: text + base.slice(pos), conflicts };
+}
+
+module.exports = { computeOps, merge3 };

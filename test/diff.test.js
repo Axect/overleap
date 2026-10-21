@@ -2,7 +2,7 @@
 
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
-const { computeOps } = require('../src/diff');
+const { computeOps, merge3 } = require('../src/diff');
 
 describe('computeOps', () => {
   it('returns empty array for identical strings', () => {
@@ -120,5 +120,37 @@ describe('computeOps', () => {
       }
     }
     assert.equal(text, '');
+  });
+});
+
+describe('merge3', () => {
+  const base = 'alpha\nbeta\ngamma\ndelta\n';
+
+  it('returns the remote text when the local file has no edits of its own', () => {
+    const remote = 'alpha\nbeta\ngamma\ndelta\n% note\n';
+    assert.deepEqual(merge3(base, base, remote), { text: remote, conflicts: 0 });
+  });
+
+  it('returns the local text when the remote side is unchanged', () => {
+    const local = 'alpha\nBETA\ngamma\ndelta\n';
+    assert.deepEqual(merge3(base, local, base), { text: local, conflicts: 0 });
+  });
+
+  it('combines edits to separate regions', () => {
+    const local = 'alpha\nBETA\ngamma\ndelta\n';
+    const remote = 'alpha\nbeta\ngamma\nDELTA\n';
+    assert.deepEqual(merge3(base, local, remote), { text: 'alpha\nBETA\ngamma\nDELTA\n', conflicts: 0 });
+  });
+
+  it('keeps an edit made identically on both sides once (no duplicated insert)', () => {
+    const both = 'alpha\nbeta beta\ngamma\ndelta\n';
+    const remote = 'alpha\nbeta beta\ngamma\ndelta\n% note\n';
+    assert.deepEqual(merge3(base, both, remote), { text: remote, conflicts: 0 });
+  });
+
+  it('resolves overlapping different edits in favour of the local text', () => {
+    const local = 'alpha\nlocal\ngamma\ndelta\n';
+    const remote = 'alpha\nremote\ngamma\ndelta\n';
+    assert.deepEqual(merge3(base, local, remote), { text: local, conflicts: 1 });
   });
 });

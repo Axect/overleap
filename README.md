@@ -108,7 +108,9 @@ Project numbers follow the last-modified order of the list, so they shift as soo
 
 **Directory binding.** The first `sync` in a directory records the project in `.overleap-project`. Later `sync` or `compile` runs in that directory refuse any other project and print the bound ID. Delete the file to re-point the directory.
 
-**Never uploaded:** dotfiles (including `.env` and `.overleap-project`), `node_modules`, editor backups, and logs or LaTeX build artifacts (`.log`, `.aux`, `.out`, `.fls`, `.fdb_latexmk`, `.synctex.gz`, `.xdv`, `.blg`, `.bcf`, `.run.xml`, `.toc`, `.lof`, `.lot`, `.nav`, `.snm`, `.vrb`). `.bbl` is synced.
+**One daemon per directory.** A running `sync` holds `.overleap-lock` (its pid) in the directory; a second `sync` there exits with an error naming that pid. Two daemons on one directory would each send every local edit, so Overleaf would apply it twice. A lock left by a process that has exited is taken over.
+
+**Never uploaded:** dotfiles (including `.env`, `.overleap-project` and `.overleap-lock`), `node_modules`, editor backups, and logs or LaTeX build artifacts (`.log`, `.aux`, `.out`, `.fls`, `.fdb_latexmk`, `.synctex.gz`, `.xdv`, `.blg`, `.bcf`, `.run.xml`, `.toc`, `.lof`, `.lot`, `.nav`, `.snm`, `.vrb`). `.bbl` is synced.
 
 ## Getting Your Cookie
 

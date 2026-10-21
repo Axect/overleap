@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- **One daemon per directory**: `sync` holds `.overleap-lock` (pid) in the sync directory and exits with an error naming the other pid when a live process already holds it; a lock left by an exited process is taken over. Two daemons on one directory (e.g. a background pueue `sync` plus a foreground one) both saw every local edit and both sent it, so Overleaf applied the second copy transformed over the first and every insert appeared twice ("WWe consider thethe probroblem…"), each daemon reported the other's op as "Conflict detected", and their binary uploads kept replacing each other's files.
+
+### Fixed
+
+- **Re-sync re-sent a stale diff (double-applied text, `Invalid hash`, `Delete component does not match`)**: after a conflict the engine re-synced, but a local change event during the re-sync's `joinDoc` passed the flush snapshot fence (version and content had not changed yet) and sent the whole edit again, diffed against content from before the acknowledged send. The server already held that edit, so it was applied twice, or rejected with a hash/delete mismatch and the client was booted. Flushes now wait while an op is in flight or a re-sync runs, and a re-sync merges the local file into the server text relative to what was last sent (three-way, `merge3` in `diff.js`), writes the result, and pushes only edits the server lacks — nothing when the file already matches. A failed re-sync makes the next flush re-sync instead of diffing against unconfirmed content.
+- **OT ack bookkeeping**: an applied op whose `meta.source` is our own `publicId` is treated as our ack (real-time sends the full op only to other clients); the version after an ack is the ack's `v + 1` instead of an increment; a repeated ack older than the op in flight is ignored; an ack applied above the version we sent at (server transformed our op over ops we never received) triggers a re-sync; remote ops older than our version (duplicate delivery) are dropped; ops arriving during a re-sync are applied after it. A remote op applied while a local edit is still waiting to be flushed is merged into the file instead of overwriting the edit.
+- **Binary replacement deleted files**: a file replaced by another editor arrives as `removeEntity(old)` then `reciveNewFile(new)`. The engine deleted the local file on the first event, released its watcher suppression as soon as `unlink()` resolved, then re-downloaded on the second; the delayed watcher events came back as local changes, re-uploading the file or, when the unlink was reported after the re-download had mapped the new id, deleting the new file on the server. Removals of a binary are now deferred 1.5 s and become an in-place update when the new file arrives; downloads and unlinks keep their watcher suppression until the watcher reports them; the old id of a file we replaced stays recognised for 30 s after the upload, since its `removeEntity` can arrive after the HTTP response; a `removeEntity` for an id the path no longer maps to leaves the local file alone; a `reciveNewFile` for a path we are uploading adopts the new id.
+
 ## [0.3.0] — 2026-10-20
 
 ### Added

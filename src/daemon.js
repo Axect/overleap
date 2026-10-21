@@ -8,7 +8,7 @@ const { fetchProjectPage, updateCookies, httpPost, httpGetBinary } = require('./
 const SocketManager = require('./socket');
 const FileWatcher = require('./watcher');
 const SyncEngine = require('./sync-engine');
-const { assertBinding, writeBinding, BINDING_FILE } = require('./binding');
+const { assertBinding, writeBinding, acquireDirLock, BINDING_FILE } = require('./binding');
 
 class Daemon {
   constructor(opts) {
@@ -18,6 +18,7 @@ class Daemon {
     this.syncEngine = null;
     this._shutdown = false;
     this._reconnecting = false; // H3: prevent concurrent reconnect attempts
+    this._releaseLock = null;
   }
 
   /**
@@ -133,6 +134,9 @@ class Daemon {
     const { cookie, url, dir } = this.config;
     const projectId = await this.resolveProjectId(this.config.projectId);
     const bound = assertBinding(dir, projectId);
+    // One daemon per directory: a second one would send every local edit again.
+    this._releaseLock = acquireDirLock(dir);
+    process.on('exit', () => this._releaseLock());
     // Store resolved projectId for reconnection
     this._projectId = projectId;
 
@@ -285,6 +289,7 @@ class Daemon {
     if (this.socketManager) {
       this.socketManager.disconnect();
     }
+    this._releaseLock?.();
 
     console.log('[daemon] Goodbye.');
     // Let the process exit naturally once all handles are released.

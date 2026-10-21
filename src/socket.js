@@ -76,6 +76,9 @@ class SocketManager extends EventEmitter {
     this.baseUrl = baseUrl;
     this.socket = null;
     this.connected = false;
+    // Our client id on the real-time server: it stamps every update we send with
+    // meta.source = publicId, which is how an applied op can be recognised as ours.
+    this.publicId = null;
   }
 
   connect() {
@@ -101,6 +104,7 @@ class SocketManager extends EventEmitter {
       this.socket.on('joinProjectResponse', (data) => {
         clearTimeout(timeout);
         this.connected = true;
+        this.publicId = data.publicId;
         this._setupEventHandlers();
         resolve({
           publicId: data.publicId,
@@ -119,6 +123,7 @@ class SocketManager extends EventEmitter {
             return;
           }
           this.connected = true;
+          this.publicId = publicId;
           this._setupEventHandlers();
           resolve({ publicId, project, permissionsLevel, protocolVersion });
         });

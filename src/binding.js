@@ -50,4 +50,56 @@ function writeBinding(dir, projectId, name) {
   fs.writeFileSync(bindingPath(dir), JSON.stringify({ id: projectId, name }, null, 2) + '\n');
 }
 
-module.exports = { BINDING_FILE, readBinding, assertBinding, writeBinding };
+// Held by the `overleap sync` running in a directory. Two daemons on one directory both
+// see every local edit and both send it: Overleaf applies the second copy transformed
+// over the first (every insert appears twice), and their binary uploads keep replacing
+// each other's files. Dotfile, so it is never uploaded.
+const LOCK_FILE = '.overleap-lock';
+
+function readLock(lockPath) {
+  try {
+    return JSON.parse(fs.readFileSync(lockPath, 'utf-8'));
+  } catch (err) {
+    return null; // missing or unreadable: treat as not held
+  }
+}
+
+function isAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err.code === 'EPERM';
+  }
+}
+
+/**
+ * Claim `dir` for this process. Throws when another live process holds it; a lock left
+ * by a process that has exited is taken over. Returns a function releasing the lock.
+ */
+function acquireDirLock(dir) {
+  const lockPath = path.join(dir, LOCK_FILE);
+  fs.mkdirSync(dir, { recursive: true });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }) + '\n', { flag: 'wx' });
+      return () => {
+        const holder = readLock(lockPath);
+        if (holder && holder.pid === process.pid) fs.rmSync(lockPath, { force: true });
+      };
+    } catch (err) {
+      if (err.code !== 'EEXIST') throw err;
+    }
+    const holder = readLock(lockPath);
+    if (holder && Number.isInteger(holder.pid) && holder.pid !== process.pid && isAlive(holder.pid)) {
+      throw new Error(
+        `Another overleap sync (pid ${holder.pid}) is already running in ${dir}. ` +
+        'Stop it first: two daemons on one directory send every local edit twice.'
+      );
+    }
+    fs.rmSync(lockPath, { force: true }); // stale: its process has exited
+  }
+  throw new Error(`Could not acquire ${lockPath}`);
+}
+
+module.exports = { BINDING_FILE, LOCK_FILE, readBinding, assertBinding, writeBinding, acquireDirLock };
